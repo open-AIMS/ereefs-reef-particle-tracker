@@ -1,0 +1,19 @@
+name: reef-residency
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.13
+  - xarray==2025.09.0
+  - netcdf4==1.7.2
+  - dask==2025.9.1
+  - numpy==2.3.3
+  - pandas==2.3.2
+  - geopandas==1.1.1
+  - shapely==2.1.1
+  - pyproj==3.7.2
+  - parcels==3.1.4
+  - matplotlib==3.10.6
+  - pip==25.2
+  - pip:
+      # (No pip-only packages needed presently)
+      - git+https://github.com/open-AIMS/data-downloader@v1.0.0
