@@ -71,6 +71,7 @@ from typing import Iterable, List, Sequence, Tuple
 import geopandas as gpd
 import numpy as np
 import xarray as xr
+import pandas as pd
 from netCDF4 import Dataset as NCDS  # For reading precomputed f-node grid crop
 from shapely.geometry import Polygon, box
 
@@ -284,6 +285,7 @@ def extract_reef_year(
 	weeks: List[int] | None = None,
 	time_chunk_hours: int = 24,
 	daily_mode: bool = True,
+	strict_hourly: bool = False,
 ) -> Path:
 	"""Extract a reef-year as either a single file or daily incremental files.
 
@@ -487,6 +489,24 @@ def extract_reef_year(
 		if day_slice.sizes.get("time", 0) == 0:
 			logging.warning("No data for day %s; creating empty placeholder", day_str)
 			continue
+		# Time diagnostics (robust to already-decoded times)
+		try:
+			ptime = pd.to_datetime(day_slice['time'].values)
+		except Exception:  # noqa: BLE001
+			ptime = pd.to_datetime(np.array(day_slice['time']).astype('datetime64[ns]'))
+		if len(ptime) != 24:
+			# List actual timestamps (HH:MM) to show cadence (e.g. 00,03,06,... for 3-hourly)
+			if len(ptime) > 0:
+				times_list = ",".join(t.strftime('%H:%M') for t in ptime.to_pydatetime())
+			else:
+				times_list = 'NO_TIMES'
+			logging.warning(
+				"Day %s has %d time steps (expected 24). Times: %s",
+				day_str, len(ptime), times_list
+			)
+			if strict_hourly:
+				logging.error("Strict hourly mode: rejecting day %s (missing hourly samples)", day_str)
+				continue
 		# Build minimal dataset
 		out = xr.Dataset(
 			{
@@ -518,6 +538,7 @@ def extract_reef_year(
 				if_start=int(if_start),
 				if_stop=int(if_stop),
 				weeks=weeks_attr if weeks_attr else "all",
+				steps_in_day=len(ptime),
 			)
 		)
 		desc = out.attrs.get("description", "")
