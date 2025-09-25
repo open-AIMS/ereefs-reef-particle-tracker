@@ -304,8 +304,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     reef_gdf = load_reef_layer(args.reef_shp)
     name_map: Dict[str, str] = reef_gdf.drop_duplicates(subset=['LABEL_ID']).set_index('LABEL_ID')['GBR_NAME'].to_dict()
 
-    week_tag = make_week_tag(weeks)
-    logging.info("Week tag: %s", week_tag)
+    # Decide week tags: if weeks supplied, single consolidated tag. If not, discover all *_w??*_particles.zarr for each reef/year.
+    explicit_week_tag = make_week_tag(weeks)
+    logging.info("Requested week tag (explicit or placeholder): %s", explicit_week_tag)
 
     any_plotted = False
     for rid in args.ids:
@@ -315,18 +316,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         gbr_name = name_map[rid]
         safe_name = _sanitize_name(gbr_name)
         for year in years:
-            zarr_dir = discover_run_paths(args.outdir, rid, year, safe_name, args.k_index, week_tag)
-            if not zarr_dir.exists():
-                logging.warning("Missing trajectory directory: %s", zarr_dir)
-                continue
-            try:
-                lon, lat, times = load_traj_points(zarr_dir, assume_dt_hours=args.assume_dt_hours)
-            except SystemExit as e:
-                logging.error(str(e))
-                continue
-            png_path = zarr_dir.with_name(zarr_dir.name.replace('_particles.zarr', '_track.png'))
-            plot_run(lon, lat, times, reef_gdf, png_path, rid, gbr_name, show=args.show, color_time=args.color_time)
-            any_plotted = True
+            if weeks:
+                # Use the consolidated explicit tag only
+                tags_to_plot = [explicit_week_tag]
+            else:
+                # Discover week tags for this reef/year
+                yr_dir = args.outdir / rid / str(year)
+                pattern = f"{safe_name}_{rid}_k{args.k_index}_{year}w*_particles.zarr"
+                matches = sorted(yr_dir.glob(pattern)) if yr_dir.exists() else []
+                # Include 'all' if present
+                all_path = yr_dir / f"{safe_name}_{rid}_k{args.k_index}_{year}all_particles.zarr"
+                if all_path.exists():
+                    matches.append(all_path)
+                tags_to_plot = []
+                for m in matches:
+                    stem = m.name
+                    # Extract the segment after _{year}
+                    try:
+                        seg = stem.split(f"_{year}",1)[1]
+                        wk = seg.split('_particles',1)[0]
+                        tags_to_plot.append(wk)
+                    except Exception:
+                        continue
+                if not tags_to_plot:
+                    # Fall back to explicit placeholder (likely 'all') even if missing (warned below)
+                    tags_to_plot = [explicit_week_tag]
+                # Deduplicate while preserving order
+                seen = set()
+                tags_to_plot = [t for t in tags_to_plot if not (t in seen or seen.add(t))]
+
+            for tag in tags_to_plot:
+                zarr_dir = discover_run_paths(args.outdir, rid, year, safe_name, args.k_index, tag)
+                if not zarr_dir.exists():
+                    logging.warning("Missing trajectory directory: %s", zarr_dir)
+                    continue
+                try:
+                    lon, lat, times = load_traj_points(zarr_dir, assume_dt_hours=args.assume_dt_hours)
+                except SystemExit as e:
+                    logging.error(str(e))
+                    continue
+                png_path = zarr_dir.with_name(zarr_dir.name.replace('_particles.zarr', f'_{tag}_track.png') if tag not in zarr_dir.name else zarr_dir.name.replace('_particles.zarr','_track.png'))
+                plot_run(lon, lat, times, reef_gdf, png_path, rid, gbr_name, show=args.show, color_time=args.color_time)
+                any_plotted = True
 
     if not any_plotted:
         logging.error("No plots produced (check inputs / outputs exist)")
