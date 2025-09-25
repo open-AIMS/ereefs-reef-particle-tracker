@@ -62,6 +62,8 @@ import contextlib
 import logging
 import sys
 import warnings
+import os
+import datetime as _dt
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
@@ -69,6 +71,7 @@ from typing import Iterable, List, Sequence, Tuple
 import geopandas as gpd
 import numpy as np
 import xarray as xr
+from netCDF4 import Dataset as NCDS  # For reading precomputed f-node grid crop
 from shapely.geometry import Polygon, box
 
 # Filter noisy library warnings for cleaner logs (especially on HPC)
@@ -218,6 +221,9 @@ def ij_window_for_buffered_bbox(
 	lat = grid.lat
 
 	mask = (lon >= minx) & (lon <= maxx) & (lat >= miny) & (lat <= maxy)
+	# Defensive improvement: exclude NaN padding so windows never straddle invalid centres
+	finite_mask = np.isfinite(lat) & np.isfinite(lon)
+	mask &= finite_mask
 	if not mask.any():
 		raise ValueError("Buffered bbox does not intersect grid; check inputs")
 
@@ -233,6 +239,25 @@ def ij_window_for_buffered_bbox(
 		buffer_km,
 	)
 	return j_start, j_stop, i_start, i_stop
+
+
+def read_fnode_crop(path: str) -> tuple[int, int, int, int]:
+	"""Read crop indices (centre-grid) from precomputed f-node NetCDF.
+
+	Expected global attribute: crop_j0_i0_j1_i1 with CSV 'j0,i0,j1,i1' where j1/i1 are exclusive.
+	"""
+	with NCDS(path, "r") as ds:  # noqa: SIM115
+		attr = getattr(ds, "crop_j0_i0_j1_i1", None)
+		if not attr:
+			raise RuntimeError(f"f-node file {path} missing crop_j0_i0_j1_i1 attribute")
+		try:
+			j0, i0, j1, i1 = map(int, str(attr).split(","))
+		except Exception as e:  # noqa: BLE001
+			raise RuntimeError(f"Unable to parse f-node crop '{attr}' in {path}") from e
+		# Sanity: ensure lon_f / lat_f present
+		_ = ds.variables["lon_f"]
+		_ = ds.variables["lat_f"]
+	return j0, i0, j1, i1
 
 
 def _sanitize_name(name: str) -> str:
@@ -255,6 +280,8 @@ def extract_reef_year(
 	k_index: int,
 	year: int,
 	outdir: Path,
+	fnode_nc: str,
+	weeks: List[int] | None = None,
 	time_chunk_hours: int = 24,
 	daily_mode: bool = True,
 ) -> Path:
@@ -270,11 +297,45 @@ def extract_reef_year(
 	"""
 
 	j_start, j_stop, i_start, i_stop = ij_window_for_buffered_bbox(grid, geom, buffer_km)
+	# Convert inclusive stops to exclusive for containment logic
+	j_stop_ex = j_stop + 1
+	i_stop_ex = i_stop + 1
+	# Read f-node crop and validate containment
+	j0, i0, j1, i1 = read_fnode_crop(fnode_nc)
+	if not (j_start >= j0 and j_stop_ex <= j1 and i_start >= i0 and i_stop_ex <= i1):
+		raise SystemExit(
+			f"Requested subcube window j[{j_start}:{j_stop_ex}) i[{i_start}:{i_stop_ex}) "
+			f"is outside f-node crop j[{j0}:{j1}) i[{i0}:{i1}). "
+			"Choose a reef closer to the coast or rebuild the f-node grid."
+		)
+	# Derive f-node slice indices per +1 rule (relative to crop origin) documented in spec
+	jf_start = (j_start - j0) + 1
+	jf_stop = (j_stop_ex - j0) + 1
+	if_start = (i_start - i0) + 1
+	if_stop = (i_stop_ex - i0) + 1
+	logging.info(
+		"Window centres j[%d:%d) i[%d:%d); f-node slices jf[%d:%d) if[%d:%d) from %s",
+		j_start,
+		j_stop_ex,
+		i_start,
+		i_stop_ex,
+		jf_start,
+		jf_stop,
+		if_start,
+		if_stop,
+		fnode_nc,
+	)
 	depth_m = float(grid.zc[k_index])
 	safe_name = _sanitize_name(gbr_name)
 	label_dir = outdir / label_id / str(year)
 	label_dir.mkdir(parents=True, exist_ok=True)
 	manifest_path = label_dir / "manifest.txt"
+
+	weeks_attr = None
+	if weeks:
+		weeks_sorted = sorted(set(weeks))
+		weeks_attr = ",".join(str(w) for w in weeks_sorted)
+		logging.info("Restricting extraction to weeks (Jan1-Jan7=1): %s", weeks_sorted)
 
 	if not daily_mode:
 		# Fallback to yearly single file (reuse earlier logic by toggling daily_mode flag off)
@@ -297,6 +358,20 @@ def extract_reef_year(
 		if any(v not in ds.variables for v in required_vars):
 			raise ValueError("Dataset missing required variables for yearly extraction")
 		ds_sub = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31T23:00:00"))
+		# If weeks restriction apply a mask to time dimension (ordinal week numbers Jan1-Jan7=1)
+		if weeks:
+			_time_vals = ds_sub['time'].values
+			_allowed = set(weeks)
+			# Convert to ordinal weeks: week = (day_of_year-1)//7 + 1
+			# Convert to UTC date first
+			secs = (_time_vals - np.datetime64('1970-01-01T00:00:00Z')) / np.timedelta64(1,'s')
+			py_dates = [_dt.datetime.utcfromtimestamp(float(s)) for s in secs]
+			day_of_year = np.array([d.timetuple().tm_yday for d in py_dates])
+			ord_weeks = ((day_of_year - 1) // 7) + 1
+			mask_time = np.isin(ord_weeks, list(_allowed))
+			if mask_time.sum() == 0:
+				logging.warning("No times found for requested ordinal weeks %s in year %d", weeks, year)
+			ds_sub = ds_sub.isel(time=mask_time)
 		spatial = ds_sub.isel(k=k_index, j=slice(j_start, j_stop + 1), i=slice(i_start, i_stop + 1))
 		out = xr.Dataset(
 			{
@@ -321,8 +396,18 @@ def extract_reef_year(
 				buffer_km=buffer_km,
 				source_opendap=opendap_url,
 				history="Extracted (year mode) with 02-extract-gbr1-subcubes.py",
+				fnode_file=os.path.abspath(fnode_nc),
+				fnode_crop=f"{j0},{i0},{j1},{i1}",
+				jf_start=int(jf_start),
+				jf_stop=int(jf_stop),
+				if_start=int(if_start),
+				if_stop=int(if_stop),
+				weeks=weeks_attr if weeks_attr else "all",
 			)
 		)
+		# Extend / create description attribute with provenance note
+		desc = out.attrs.get("description", "")
+		out.attrs["description"] = (desc + " Subcube verified to lie inside f-node crop; jf_*/if_* give matching corner slices.").strip()
 		comp = dict(zlib=True, complevel=4, shuffle=True)
 		encoding = {"u": comp, "v": comp, "longitude": comp, "latitude": comp, "time": {}, "zc": {}}
 		out = out.chunk({"time": time_chunk_hours})
@@ -360,10 +445,21 @@ def extract_reef_year(
 		k=k_index, j=slice(j_start, j_stop + 1), i=slice(i_start, i_stop + 1)
 	)
 
-	# Build list of all days of year
+	# Build list of all days of year (will filter by weeks if provided)
 	start = np.datetime64(f"{year}-01-01")
 	end = np.datetime64(f"{year}-12-31")
 	all_days = np.arange(start, end + np.timedelta64(1, "D"), dtype="datetime64[D]")
+	if weeks:
+		_allowed = set(weeks)
+		_filtered = []
+		for d in all_days:
+			# Convert to python date
+			py_date = (d.astype('datetime64[D]')).astype(object)
+			ordinal_week = ((py_date.timetuple().tm_yday - 1) // 7) + 1
+			if ordinal_week in _allowed:
+				_filtered.append(d)
+		all_days = np.array(_filtered, dtype='datetime64[D]')
+		logging.info("Filtered days by ordinal weeks %s -> %d days", sorted(_allowed), all_days.size)
 
 	completed = set()
 	if manifest_path.exists():
@@ -415,8 +511,17 @@ def extract_reef_year(
 				buffer_km=buffer_km,
 				source_opendap=opendap_url,
 				history="Daily extraction with 02-extract-gbr1-subcubes.py",
+				fnode_file=os.path.abspath(fnode_nc),
+				fnode_crop=f"{j0},{i0},{j1},{i1}",
+				jf_start=int(jf_start),
+				jf_stop=int(jf_stop),
+				if_start=int(if_start),
+				if_stop=int(if_stop),
+				weeks=weeks_attr if weeks_attr else "all",
 			)
 		)
+		desc = out.attrs.get("description", "")
+		out.attrs["description"] = (desc + " Subcube verified to lie inside f-node crop; jf_*/if_* give matching corner slices.").strip()
 		tmp_day = day_path.with_suffix(".tmp.nc")
 		if tmp_day.exists():
 			tmp_day.unlink(missing_ok=True)
@@ -446,6 +551,8 @@ def extract_all_years(
 	buffer_km: float,
 	k_index: int,
 	outdir: Path,
+	fnode_nc: str,
+	weeks: List[int] | None = None,
 ) -> None:
 	"""Loop over reefs and years extracting subcubes.
 
@@ -469,6 +576,8 @@ def extract_all_years(
 					k_index=k_index,
 					year=year,
 					outdir=outdir,
+					fnode_nc=fnode_nc,
+					weeks=weeks,
 					daily_mode=True,
 				)
 			except Exception as e:  # noqa: BLE001
@@ -534,7 +643,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 		nargs="*",
 		type=int,
 		default=None,
-		help="(Reserved for simulation stage) Weeks not used here; accepted for pipeline uniformity.",
+		help="Ordinal weeks (Jan1-Jan7=1, Jan8-Jan14=2, ...) to process; two values = inclusive range; omit for all weeks.",
+	)
+	p.add_argument(
+		"--fnode-nc",
+		type=str,
+		default="working/02/gbr1_fnodes.nc",
+		help="Path to precomputed f-node NetCDF containing lon_f/lat_f and crop_j0_i0_j1_i1",
 	)
 	p.add_argument(
 		"--seed", type=int, default=42, help="Random seed (reserved for reproducibility, not heavily used here)."
@@ -559,6 +674,33 @@ def _years_list(year_args: List[int]) -> List[int]:
 	return sorted(set(year_args))
 
 
+def _weeks_list(week_args: List[int] | None) -> List[int] | None:
+	"""Normalize weeks argument (ordinal weeks: Jan1-Jan7=1, Jan8-Jan14=2, ...).
+
+	Rules:
+	- None -> None (all weeks)
+	- 1 value -> list with that value
+	- 2 values -> inclusive range
+	- >2 -> unique sorted list
+	Validation: weeks must be >=1; no fixed upper bound because last partial week can be 52 or 53 depending on year length.
+	"""
+	if not week_args:
+		return None
+	if len(week_args) == 1:
+		weeks = week_args
+	elif len(week_args) == 2:
+		a, b = week_args
+		if a > b:
+			a, b = b, a
+		weeks = list(range(a, b + 1))
+	else:
+		weeks = sorted(set(week_args))
+	for w in weeks:
+		if w < 1:
+			raise ValueError(f"Week number {w} invalid; must be >= 1")
+	return weeks
+
+
 def main(argv: Sequence[str] | None = None) -> int:
 	args = parse_args(argv)
 	configure_logging(args.log_file)
@@ -570,6 +712,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 		return 2
 
 	years = _years_list(args.years)
+	try:
+		weeks = _weeks_list(args.weeks)
+	except ValueError as e:
+		logging.error(str(e))
+		return 7
+	if weeks:
+		logging.info("Requested weeks filter: %s", weeks)
+		# Determine maximum ordinal week for each year (based on day count)
+		for y in years:
+			# Days in year
+			leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
+			days_in_year = 366 if leap else 365
+			max_week = ((days_in_year - 1) // 7) + 1
+			too_high = [w for w in weeks if w > max_week]
+			logging.info("Year %d has %d ordinal weeks (last may be partial)", y, max_week)
+			if too_high:
+				logging.warning("Weeks %s exceed max %d for year %d and will match zero days", too_high, max_week, y)
+	else:
+		logging.info("No weeks filter: processing all weeks of each year")
 	logging.info("Years to process: %s", years)
 	try:
 		grid = load_grid(args.opendap)
@@ -621,6 +782,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 			buffer_km=args.buffer_km,
 			k_index=k_index,
 			outdir=args.outdir,
+			fnode_nc=args.fnode_nc,
+			weeks=weeks,
 		)
 	except Exception:
 		return 6
