@@ -60,11 +60,9 @@ and fnode_crop attributes to every subcube. Weekly files are named with the star
 What is written
 Zarr trajectory store: working/02/<LABEL_ID>/<YEAR>/<SAFE_NAME>_<LABEL_ID>_k<kindex>_<YEAR>w<week>_particles.zarr
 containing standard Parcels variables (lon, lat, time, plus any future particle variables) in the
-(trajectory, obs) layout suitable for multi-particle scaling. One shapefile per reef id, year and
-week under working/04/ named {GBR_NAME_NO_SPACES}_{LABEL_ID}_k{kindex}_{year}w{week:02d}_track.shp.
-Each feature is one hourly position with attributes TIME_ISO and HOUR_IDX. A concise log summarises
-the discovered subcube path, the corner slice indices, the number of hours simulated and the
-shapefile path.
+(trajectory, obs) layout suitable for multi-particle scaling. Shapefile export has been removed from
+this script to keep the simulation lean; use 04b-convert-particle-zarr-to-shp.py to produce point
+shapefiles (one point per output step) for GIS/debug workflows.
 
 Limitations
 This is a basic, single particle hourly advection. It is meant to verify the geometry and indexing rather 
@@ -94,9 +92,8 @@ import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
-import geopandas as gpd
-from shapely.geometry import Point
-from netCDF4 import Dataset as NCDS  # retained for reading particle output only
+import geopandas as gpd  # still required here only for reef name lookup
+# Removed netCDF4 import (no NetCDF particle output reading in this refactored version)
 
 from parcels import FieldSet, ParticleSet, JITParticle, AdvectionRK4
 # Explicit import path for ErrorCode in Parcels 3.1.4
@@ -362,14 +359,13 @@ def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List
 	reef_dir = outdir / label_id / str(year)
 	reef_dir.mkdir(parents=True, exist_ok=True)
 	particle_base = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_particles.zarr"
-	shp_path = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_track.shp"
 
 	hours_expected = len(daily_files) * 24
 
 	if dry_run:
 		logging.info(
-			"DRY label=%s name=%s year=%d weeks=%s files=%d jf[%d:%d) if[%d:%d) expect_hours=%d shp=%s",
-			label_id, gbr_name, year, week_tag, len(daily_files), meta.jf_start, meta.jf_stop, meta.if_start, meta.if_stop, hours_expected, shp_path
+			"DRY label=%s name=%s year=%d weeks=%s files=%d jf[%d:%d) if[%d:%d) expect_hours=%d zarr=%s",
+			label_id, gbr_name, year, week_tag, len(daily_files), meta.jf_start, meta.jf_stop, meta.if_start, meta.if_stop, hours_expected, particle_base
 		)
 		return
 
@@ -512,131 +508,9 @@ def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List
 			with contextlib.suppress(Exception):
 				particle_file.close()
 
-	# Read trajectory output (NetCDF or Zarr)
-	# Zarr-only trajectory read
-	import xarray as _xr  # local import
-	# particle_base already includes the .zarr suffix; reopen directly
-	ds_traj = _xr.open_zarr(str(particle_base))
-	try:
-		lons = ds_traj['lon'].values
-		lats = ds_traj['lat'].values
-		logging.info("TRAJ RAW (zarr) lon.shape=%s lat.shape=%s", getattr(lons,'shape',None), getattr(lats,'shape',None))
-		if lons.ndim > 1:
-			lons = lons.reshape(-1)
-			lats = lats.reshape(-1)
-		if 'time' in ds_traj.variables:
-			try:
-				_times = ds_traj['time'].values
-				# Flatten possible (traj, obs)
-				if _times.ndim > 1:
-					_times = _times.reshape(-1)
-				times_list = pd.to_datetime(_times).tolist()
-			except Exception:
-				# Fallback sequential
-				times_list = [pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
-		else:
-			times_list = [pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
-	finally:
-		ds_traj.close()
-
-	# Convert to Australia/Brisbane timezone & ISO format with offset
-	# Normalize times_list to timezone-aware UTC Timestamps robustly
-	if not times_list:
-		raise SystemExit("No trajectory time steps produced; empty times_list")
-	# If times shorter than positions (common if output writer only stores one stamp for multi-points), reconstruct sequential times using output interval.
-	# Flatten nested list structure e.g. [ [Timestamp(...), Timestamp(...)] ] which can appear if already a list-like container got wrapped
-	if len(times_list) == 1 and isinstance(times_list[0], (list, tuple)):
-		inner = list(times_list[0])
-		logging.info("Flattening nested times_list wrapper: inner_len=%d", len(inner))
-		times_list = inner
-	# Reconstruct only if a single base timestamp for multiple positions
-	if len(times_list) == 1 and len(lons) > 1:
-		assumed_dt = timedelta(hours=0.5) if debug_short_run else timedelta(hours=1)
-		base_t = times_list[0]
-		logging.info("Reconstructing times from single stamp: base=%s count=%d interval=%s", base_t, len(lons), assumed_dt)
-		if isinstance(base_t, pd.Timestamp):
-			base_t = base_t.tz_convert('UTC') if base_t.tzinfo else base_t.tz_localize('UTC')
-		times_list = [base_t + n * assumed_dt for n in range(len(lons))]
-	normalized: List[pd.Timestamp] = []
-	for idx, t in enumerate(times_list):
-		candidate = None
-		if isinstance(t, pd.Timestamp):
-			candidate = t if t.tzinfo else t.tz_localize('UTC')
-		else:
-			try:
-				candidate = pd.Timestamp(t)
-			except Exception:  # noqa: BLE001
-				candidate = None
-			if candidate is not None and candidate.tzinfo is None:
-				candidate = candidate.tz_localize('UTC')
-		if candidate is None:
-			candidate = pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=idx)
-		normalized.append(candidate)
-	bris_times = pd.DatetimeIndex(normalized).tz_convert('Australia/Brisbane')
-
-	# --- Normalize trajectory array shapes to 1-D and align lengths with times ---
-	import numpy as _np
-	lons = _np.asarray(lons)
-	lats = _np.asarray(lats)
-	if lons.shape != lats.shape:
-		logging.warning("Lon/lat shape mismatch %s vs %s; attempting flatten via ravel()", lons.shape, lats.shape)
-		lons = lons.ravel(); lats = lats.ravel()
-	if lons.ndim > 1:
-		# Assume first axis = time, remaining combine to particle dimension(s)
-		orig_shape = lons.shape
-		time_len = orig_shape[0]
-		part_len = int(_np.prod(orig_shape[1:]))
-		lons2 = lons.reshape(time_len, part_len)
-		lats2 = lats.reshape(time_len, part_len)
-		if part_len == 1:
-			lons = lons2[:, 0]
-			lats = lats2[:, 0]
-		else:
-			# Replicate times for each particle column if needed
-			if len(normalized) == time_len:
-				# Expand times to match flattened observations (time, particle)
-				normalized = [t for t in normalized for _ in range(part_len)]
-			elif len(normalized) != time_len * part_len:
-				logging.warning(
-					"Unexpected times vs data mismatch: times=%d time_len=%d part_len=%d; trunc/pad to match flattened size", 
-					len(normalized), time_len, part_len
-				)
-				flat_size = time_len * part_len
-				if len(normalized) > flat_size:
-					normalized = normalized[:flat_size]
-				else:
-					# pad by repeating last timestamp
-					if normalized:
-						last_t = normalized[-1]
-						normalized.extend([last_t]*(flat_size - len(normalized)))
-			lons = lons2.ravel()
-			lats = lats2.ravel()
-		logging.info("Flattened trajectory arrays from %s to %s (time_len=%d, particles=%d)", orig_shape, lons.shape, time_len, part_len)
-	# After potential expansion/truncation, ensure equal lengths
-	min_len = min(len(lons), len(lats), len(normalized))
-	if len(lons) != len(lats) or len(lons) != len(normalized):
-		logging.warning("Length mismatch (lon=%d lat=%d time=%d); truncating to %d", len(lons), len(lats), len(normalized), min_len)
-		lons = lons[:min_len]
-		lats = lats[:min_len]
-		normalized = normalized[:min_len]
-	# Rebuild Brisbane times from possibly expanded normalized list
-	bris_times = pd.DatetimeIndex(normalized).tz_convert('Australia/Brisbane')
-	iso_times = [t.isoformat() for t in bris_times]
-
-	gdf = gpd.GeoDataFrame(
-		{
-			'LABEL_ID': [label_id]*len(lons),
-			'GBR_NAME': [gbr_name]*len(lons),
-			'HOUR_IDX': list(range(len(lons))),
-			'TIME_ISO': iso_times,
-		},
-		geometry=[Point(float(x), float(y)) for x, y in zip(lons, lats)], crs='EPSG:4326'
-	)
-	gdf.to_file(shp_path)
-
 	logging.info(
-		"RUN label=%s name=%s year=%d weeks=%s subcubes=%d hours=%d track=%s (A-grid)",
-		label_id, gbr_name, year, week_tag, len(daily_files), len(lons), shp_path
+		"RUN label=%s name=%s year=%d weeks=%s subcubes=%d runtime=%s zarr=%s (A-grid)",
+		label_id, gbr_name, year, week_tag, len(daily_files), runtime, particle_base
 	)
 
 
