@@ -217,6 +217,8 @@ def build_corners(lon_c: np.ndarray, lat_c: np.ndarray) -> Tuple[np.ndarray, np.
 # -----------------------------------------------------------------------------
 def write_netcdf(lon_f: np.ndarray, lat_f: np.ndarray, crop: Tuple[int,int,int,int], path: str = OUT_NC):
     j0, j1, i0, i1 = crop
+    # Make sure output directory exists
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with Dataset(path, "w") as ds:
         ds.createDimension("jf", lon_f.shape[0])
         ds.createDimension("if", lon_f.shape[1])
