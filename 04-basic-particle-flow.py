@@ -58,10 +58,13 @@ and fnode_crop attributes to every subcube. Weekly files are named with the star
  f-nodes, not the exact locations of the velocity stagger points. ([Ocean Parcels Documentation][3])
 
 What is written
-One shapefile per reef id, year and week under working/04/ named 
-{GBR_NAME_NO_SPACES}_{LABEL_ID}*k{kindex}*{year}w{week:02d}_track.shp. Each feature is one hourly 
-position with attributes TIME_ISO and HOUR_IDX. A concise log summarises the discovered subcube path, 
-the f-node slice indices, the number of hours simulated and the shapefile path.
+Zarr trajectory store: working/02/<LABEL_ID>/<YEAR>/<SAFE_NAME>_<LABEL_ID>_k<kindex>_<YEAR>w<week>_particles.zarr
+containing standard Parcels variables (lon, lat, time, plus any future particle variables) in the
+(trajectory, obs) layout suitable for multi-particle scaling. One shapefile per reef id, year and
+week under working/04/ named {GBR_NAME_NO_SPACES}_{LABEL_ID}_k{kindex}_{year}w{week:02d}_track.shp.
+Each feature is one hourly position with attributes TIME_ISO and HOUR_IDX. A concise log summarises
+the discovered subcube path, the corner slice indices, the number of hours simulated and the
+shapefile path.
 
 Limitations
 This is a basic, single particle hourly advection. It is meant to verify the geometry and indexing rather 
@@ -358,7 +361,7 @@ def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List
 
 	reef_dir = outdir / label_id / str(year)
 	reef_dir.mkdir(parents=True, exist_ok=True)
-	particle_base = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_particles"
+	particle_base = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_particles.zarr"
 	shp_path = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_track.shp"
 
 	hours_expected = len(daily_files) * 24
@@ -384,23 +387,13 @@ def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List
 				first_ds.close()
 
 	# Clean existing outputs if overwrite requested
-	nc_existing = Path(str(particle_base) + '.nc')
-	zarr_existing = Path(str(particle_base) + '.zarr')
-	if (nc_existing.exists() or zarr_existing.exists()) and overwrite:
-		logging.info("Overwriting existing output: %s(.nc|.zarr)", particle_base)
+	zarr_existing = particle_base
+	if zarr_existing.exists() and overwrite:
+		logging.info("Overwriting existing Zarr output: %s", zarr_existing)
 		import shutil
-		with contextlib.suppress(Exception):
-			if nc_existing.exists():
-				logging.info("Removing existing netcdf output file: %s", nc_existing)
-				nc_existing.unlink()
-		# with contextlib.suppress(Exception):
-		if zarr_existing.is_dir():
-			shutil.rmtree(zarr_existing)
-	elif (nc_existing.exists() or zarr_existing.exists()) and not overwrite:
-		raise SystemExit(f"Output already exists (use --overwrite to replace): {particle_base}")
-
-	if (nc_existing.exists() or zarr_existing.exists()) and overwrite:
-		logging.warning("Existing output still exists: %s(.nc|.zarr)", particle_base)
+		shutil.rmtree(zarr_existing, ignore_errors=True)
+	elif zarr_existing.exists() and not overwrite:
+		raise SystemExit(f"Output already exists (use --overwrite to replace): {zarr_existing}")
 		
 	# Choose a robust interior start cell (avoid any NaN or boundary interpolation issues)
 	lon_arr = meta.lon
@@ -520,53 +513,31 @@ def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List
 				particle_file.close()
 
 	# Read trajectory output (NetCDF or Zarr)
-	nc_path = Path(str(particle_base) + '.nc')
-	zarr_path = Path(str(particle_base) + '.zarr')
-	if nc_path.exists():
-		with NCDS(str(nc_path)) as pf:
-			lons = pf.variables['lon'][:]
-			lats = pf.variables['lat'][:]
-			logging.info("TRAJ RAW (nc) lon.shape=%s lat.shape=%s", getattr(lons,'shape',None), getattr(lats,'shape',None))
-			if 'time' in pf.variables:
-				# Try to decode CF units; fall back gracefully.
-				try:
-					units = getattr(pf.variables['time'], 'units', None)
-					calendar = getattr(pf.variables['time'], 'calendar', 'standard')
-					if units:
-						from cftime import num2date  # local import
-						ctime = num2date(pf.variables['time'][:], units=units, calendar=calendar)
-						# Convert to pandas Timestamps in UTC when possible
-						try:
-							ptime = [pd.Timestamp(t).tz_localize('UTC') for t in ctime]
-						except Exception:  # noqa: BLE001
-							ptime = [pd.to_datetime(str(t), utc=True, errors='ignore') for t in ctime]
-						times_list = ptime
-					else:
-						raise ValueError('Missing time units')
-				except Exception:
-					# Fallback: assume sequential hourly offsets from start time
-					times_list = [pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
-			else:
-				# No explicit time variable; create sequential hours
+	# Zarr-only trajectory read
+	import xarray as _xr  # local import
+	# particle_base already includes the .zarr suffix; reopen directly
+	ds_traj = _xr.open_zarr(str(particle_base))
+	try:
+		lons = ds_traj['lon'].values
+		lats = ds_traj['lat'].values
+		logging.info("TRAJ RAW (zarr) lon.shape=%s lat.shape=%s", getattr(lons,'shape',None), getattr(lats,'shape',None))
+		if lons.ndim > 1:
+			lons = lons.reshape(-1)
+			lats = lats.reshape(-1)
+		if 'time' in ds_traj.variables:
+			try:
+				_times = ds_traj['time'].values
+				# Flatten possible (traj, obs)
+				if _times.ndim > 1:
+					_times = _times.reshape(-1)
+				times_list = pd.to_datetime(_times).tolist()
+			except Exception:
+				# Fallback sequential
 				times_list = [pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
-	elif zarr_path.exists():
-		import xarray as _xr  # local import to avoid confusion
-		ds_traj = _xr.open_zarr(zarr_path)
-		try:
-			lons = ds_traj['lon'].values
-			lats = ds_traj['lat'].values
-			logging.info("TRAJ RAW (zarr) lon.shape=%s lat.shape=%s", getattr(lons,'shape',None), getattr(lats,'shape',None))
-			if lons.ndim > 1:
-				lons = lons.reshape(-1)
-				lats = lats.reshape(-1)
-			if 'time' in ds_traj.variables:
-				times_list = pd.to_datetime(ds_traj['time'].values).tolist()
-			else:
-				times_list = [t_start + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
-		finally:
-			ds_traj.close()
-	else:
-		raise SystemExit(f"No particle output found (.nc or .zarr) for base {particle_base}")
+		else:
+			times_list = [pd.Timestamp(t_start, tz='UTC') + pd.Timedelta(hours=int(i)) for i in range(len(lons))]
+	finally:
+		ds_traj.close()
 
 	# Convert to Australia/Brisbane timezone & ISO format with offset
 	# Normalize times_list to timezone-aware UTC Timestamps robustly

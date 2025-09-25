@@ -88,6 +88,7 @@ def discover_run_paths(base_out: Path, label_id: str, year: int, safe_name: str,
     return zarr_dir
 
 
+
 def load_reef_layer(path: Path) -> gpd.GeoDataFrame:
     if not path.exists():
         raise SystemExit(f"Reef shapefile not found: {path}")
