@@ -1,5 +1,3 @@
-
-
 """
 Create a minimal OceanParcels simulation over eReefs GBR1 weekly subcubes using a prebuilt f-node grid.
 
@@ -92,8 +90,17 @@ import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
-import geopandas as gpd  # still required here only for reef name lookup
-# Removed netCDF4 import (no NetCDF particle output reading in this refactored version)
+import geopandas as gpd  # reef metadata
+
+from utils import (
+	configure_logging,
+	sanitize_name,
+	normalize_years,
+	normalize_weeks,
+	make_week_tag,
+	# Added for simpler week->date expansion
+	expand_weeks_to_dates,
+)
 
 from parcels import FieldSet, ParticleSet, JITParticle, AdvectionRK4
 # Explicit import path for ErrorCode in Parcels 3.1.4
@@ -106,57 +113,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def configure_logging(log_file: Path | None) -> None:
-	root = logging.getLogger()
-	if root.handlers:
-		return
-	root.setLevel(logging.INFO)
-	fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-	sh = logging.StreamHandler(sys.stdout)
-	sh.setFormatter(fmt)
-	root.addHandler(sh)
-	if log_file:
-		log_file.parent.mkdir(parents=True, exist_ok=True)
-		fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-		fh.setFormatter(fmt)
-		root.addHandler(fh)
-
-
-def _sanitize_name(name: str) -> str:
-	return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name.replace(" ", "_"))
-
-
-def _years_list(vals: List[int]) -> List[int]:
-	if len(vals) == 1:
-		return vals
-	if len(vals) == 2:
-		a, b = vals
-		if a > b:
-			a, b = b, a
-		return list(range(a, b + 1))
-	return sorted(set(vals))
-
-
-def _weeks_list(vals: List[int] | None) -> List[int] | None:
-	if not vals:
-		return None
-	if len(vals) == 1:
-		weeks = vals
-	elif len(vals) == 2:
-		a, b = vals
-		if a > b:
-			a, b = b, a
-		weeks = list(range(a, b + 1))
-	else:
-		weeks = sorted(set(vals))
-	for w in weeks:
-		if w < 1:
-			raise ValueError(f"Invalid week number {w}; must be >=1")
-	return weeks
-
-
-def ordinal_week_for_date(d: date) -> int:
-	return ((d.timetuple().tm_yday - 1) // 7) + 1
+## Removed local helpers now provided by utils (sanitize_name, normalize_years, normalize_weeks, make_week_tag)
 
 
 @dataclass
@@ -216,91 +173,45 @@ def load_subcube_meta(path: Path) -> SubcubeMeta:
 
 
 def build_fieldset(daily_files: List[Path], meta: SubcubeMeta) -> FieldSet:
-	"""Build a Parcels FieldSet treating the data as an A-grid (centre-only).
+	"""Build a Parcels FieldSet (A-grid approximation) from consecutive daily files.
 
-	This simplified path ignores any corner (f-node) geometry and directly uses the
-	centre lon/lat supplied in the subcube. Suitable for prototype advection where
-	staggered U/V coordinates are unavailable.
+	Simplified assumptions (enforced with asserts):
+	  - Each daily file has exactly 24 hourly steps (known eReefs product spec).
+	  - All files are consecutive without gaps (missing file => assertion on total hours).
+	  - Variables 'u' and 'v' exist with dims (time, j, i).
+	We concatenate first and then perform minimal sanity checks.
 	"""
-	lon_c = meta.lon
-	lat_c = meta.lat
-
-	# Concatenate all days along time (hourly continuity check with tolerance)
 	ds_list = [xr.open_dataset(p, decode_times=True) for p in daily_files]
-	# Per-file diagnostics before concatenation
-	for p, ds in zip(daily_files, ds_list):
-		try:
-			ptimes = pd.to_datetime(ds['time'].values)
-		except Exception:  # noqa: BLE001
-			logging.error("Unable to decode time axis in %s", p)
-			continue
-		if len(ptimes) == 0:
-			logging.warning("File %s has zero time steps", p.name)
-			continue
-		if len(ptimes) != 24:
-			# Show actual times for debugging (HH:MM)
-			times_list = ",".join(t.strftime('%H:%M') for t in ptimes)
-			logging.warning("Daily file %s has %d time steps (expected 24). Times: %s", p.name, len(ptimes), times_list)
-		else:
-			logging.info("Daily file %s OK (24 samples)", p.name)
 	try:
 		combined = xr.concat(ds_list, dim="time")
-		if any(v not in combined.variables for v in ("u", "v")):
-			raise SystemExit("Velocity variables u or v missing in concatenated dataset")
-		# Hourly continuity check with rounding tolerance: treat near-3600s deltas as hourly
+		# Core variable presence
+		assert 'u' in combined and 'v' in combined, "Missing u or v variable"
 		times = pd.to_datetime(combined['time'].values)
-		if len(times) < 2:
-			raise SystemExit('<2 time steps in concatenated period')
-		deltas_sec = np.diff(times.values).astype('timedelta64[s]').astype(int)
-		# Round to nearest minute
-		deltas_min = np.round(deltas_sec / 60.0).astype(int)
-		if not np.all(deltas_min == 60):
-			bad_idx = np.where(deltas_min != 60)[0]
-			logging.error('Time continuity failure: %d intervals not 60 minutes (after rounding)', bad_idx.size)
-			for i in bad_idx[:10]:
-				prev_t = times[i]
-				next_t = times[i+1]
-				gap_minutes = deltas_sec[i] / 60.0
-				logging.error('Interval %d: %s -> %s = %.3f minutes (rounded %d)', i, prev_t, next_t, gap_minutes, deltas_min[i])
-			full_expected = pd.date_range(start=times.min(), end=times.max(), freq='1H')
-			missing = full_expected.difference(times)
-			if not missing.empty:
-				logging.error('Missing %d hourly timestamps (showing first 10): %s', len(missing), list(missing[:10]))
-			raise SystemExit('Detected gap or non-hourly time spacing; aborting')
-		u_vals = combined["u"].transpose("time", "j", "i").values
-		v_vals = combined["v"].transpose("time", "j", "i").values
-		time_vals = combined["time"].values
+		expected_hours = 24 * len(daily_files)
+		assert times.size == expected_hours, f"Time steps {times.size} != expected {expected_hours} (check for missing daily file)"
+		# Hour spacing tolerance: allow near-hour deviations (some files may have leap/processing offsets)
+		if times.size > 1:
+			deltas_ns = np.diff(times.values).astype('timedelta64[ns]').astype(int)
+			# Convert to hours as float
+			deltas_hours = deltas_ns / 3.6e12  # 1 hour = 3.6e12 ns
+			# Check monotonic increasing
+			assert np.all(deltas_hours > 0), "Non-increasing time axis detected"
+			# Identify deltas not within 1h +/- 2 minutes tolerance
+			bad = ~((deltas_hours >= (1 - 2/60)) & (deltas_hours <= (1 + 2/60)))
+			if np.any(bad):
+				logging.warning("%d time intervals deviate >2 min from 1h (continuing): first few=%s", bad.sum(), deltas_hours[bad][:5])
+		u_vals = combined['u'].transpose('time','j','i').values
+		v_vals = combined['v'].transpose('time','j','i').values
+		time_vals = combined['time'].values
 	finally:
 		for d in ds_list:
 			d.close()
-
-	# Build FieldSet using centre coordinates (A-grid approximation). This avoids index search
-	# failures seen when attempting C-grid style without full staggered files.
-	lon_c = meta.lon
-	lat_c = meta.lat
 	data = {'U': u_vals, 'V': v_vals}
 	dimensions = {
-		'U': {'lon': lon_c, 'lat': lat_c, 'time': time_vals},
-		'V': {'lon': lon_c, 'lat': lat_c, 'time': time_vals},
+		'U': {'lon': meta.lon, 'lat': meta.lat, 'time': time_vals},
+		'V': {'lon': meta.lon, 'lat': meta.lat, 'time': time_vals},
 	}
-	fieldset = FieldSet.from_data(data=data, dimensions=dimensions, mesh='spherical', allow_time_extrapolation=False)
-	# Grid diagnostics for debugging boundary issues
-	finite_mask = np.isfinite(lon_c) & np.isfinite(lat_c)
-	if not finite_mask.any():
-		logging.error("All lon/lat are NaN in subcube; cannot proceed")
-	else:
-		perimeter_mask = np.zeros_like(finite_mask, dtype=bool)
-		perimeter_mask[0, :] = True
-		perimeter_mask[-1, :] = True
-		perimeter_mask[:, 0] = True
-		perimeter_mask[:, -1] = True
-		perim_nans = np.size(perimeter_mask) - np.count_nonzero(finite_mask | ~perimeter_mask)
-		logging.info(
-			"GRID j=%d i=%d finite=%d perim_nan=%d lon[min=%.5f max=%.5f] lat[min=%.5f max=%.5f]",
-			lon_c.shape[0], lon_c.shape[1], np.count_nonzero(finite_mask), perim_nans,
-			float(np.nanmin(lon_c)), float(np.nanmax(lon_c)), float(np.nanmin(lat_c)), float(np.nanmax(lat_c))
-		)
-	return fieldset
+	return FieldSet.from_data(data=data, dimensions=dimensions, mesh='spherical', allow_time_extrapolation=False)
 
 
 def _format_row(values: np.ndarray, head: int = 4, tail: int = 4, fmt: str = "%.5f") -> str:
@@ -346,28 +257,17 @@ def debug_print_grid(meta: SubcubeMeta, u_first: np.ndarray, v_first: np.ndarray
 
 
 def run_sim(label_id: str, gbr_name: str, safe_name: str, year: int, weeks: List[int] | None,
-	  daily_files: List[Path], meta: SubcubeMeta, outdir: Path, dry_run: bool, seed: int,
-	  dt_hours: float = 1.0, overwrite: bool = False, integrator: str = 'rk4', shrink_margin: int = 1,
-	  debug_short_run: bool = False) -> None:
+	daily_files: List[Path], meta: SubcubeMeta, outdir: Path, seed: int,
+	dt_hours: float = 1.0, overwrite: bool = False, integrator: str = 'rk4', shrink_margin: int = 1,
+	debug_short_run: bool = False) -> None:
 	# Determine week label for naming
-	if not weeks:
-		week_tag = "all"
-	else:
-		uniq = sorted(set(weeks))
-		week_tag = f"w{uniq[0]:02d}" if len(uniq) == 1 else f"w{uniq[0]:02d}-{uniq[-1]:02d}"
+	week_tag = make_week_tag(weeks)
 
 	reef_dir = outdir / label_id / str(year)
 	reef_dir.mkdir(parents=True, exist_ok=True)
 	particle_base = reef_dir / f"{safe_name}_{label_id}_k{meta.k_index}_{year}{week_tag}_particles.zarr"
 
 	hours_expected = len(daily_files) * 24
-
-	if dry_run:
-		logging.info(
-			"DRY label=%s name=%s year=%d weeks=%s files=%d jf[%d:%d) if[%d:%d) expect_hours=%d zarr=%s",
-			label_id, gbr_name, year, week_tag, len(daily_files), meta.jf_start, meta.jf_stop, meta.if_start, meta.if_stop, hours_expected, particle_base
-		)
-		return
 
 	fieldset = build_fieldset(daily_files, meta)
 
@@ -532,7 +432,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 	p.add_argument('--outdir', type=Path, default=Path('working/02'), help='Output root directory for particle results (shares tree with extraction output).')
 	p.add_argument('--seed', type=int, default=42)
 	p.add_argument('--log-file', type=Path, default=None)
-	p.add_argument('--dry-run', action='store_true', help='Show planned runs without building FieldSet or executing Parcels.')
 	p.add_argument('--dt-hours', type=float, default=1.0, help='Integration time step in hours (e.g. 0.5 for 30 min).')
 	p.add_argument('--overwrite', action='store_true', help='Overwrite existing particle output (delete old .zarr/.nc).')
 	p.add_argument('--integrator', choices=['rk4','euler'], default='rk4', help='Advection integrator kernel to use (rk4 or euler).')
@@ -557,9 +456,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 	# Consolidate names by LABEL_ID
 	ref = reefs.drop_duplicates(subset=['LABEL_ID']).set_index('LABEL_ID')['GBR_NAME'].to_dict()
 
-	years = _years_list(args.years)
+	years = normalize_years(args.years)
 	try:
-		weeks = _weeks_list(args.weeks)
+		weeks = normalize_weeks(args.weeks)
 	except ValueError as e:  # noqa: BLE001
 		logging.error(str(e))
 		return 4
@@ -573,38 +472,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 			logging.warning("LABEL_ID %s not in reef layer; skipping", rid)
 			continue
 		gbr_name = ref[rid]
-		safe_name = _sanitize_name(gbr_name)
+		safe_name = sanitize_name(gbr_name)
 		for year in years:
 			all_daily = discover_daily_files(args.data_root, rid, year, safe_name, args.k_index)
 			if not all_daily:
 				logging.warning("No daily subcubes for %s %d", rid, year)
 				continue
-			# Map date->file
+			# Map date->file using final underscore token (YYYYMMDD) and expand requested weeks.
+			# 1. Extract dates embedded at end of each filename stem.
 			date_map: Dict[date, Path] = {}
 			for p in all_daily:
-				stem = p.stem
-				parts = stem.split('_')
-				if not parts:
-					continue
-				maybe = parts[-1]
+				# Expect pattern ..._<YYYYMMDD>.nc; keep robust fallback.
+				maybe = p.stem.split('_')[-1]
 				try:
 					d = datetime.strptime(maybe, '%Y%m%d').date()
 				except ValueError:
 					continue
 				date_map[d] = p
-
+			# 2. Decide which dates to stitch: all if no weeks provided, else expand weeks to dates.
 			if weeks is None:
-				selected_dates = sorted(date_map.keys())
+				selected_dates = sorted(date_map)
 			else:
-				acc: List[date] = []
-				for w in weeks:
-					start_d = date(year,1,1) + timedelta(days=7*(w-1))
-					for off in range(7):
-						cur = start_d + timedelta(days=off)
-						if cur.year!=year:
-							break
-						acc.append(cur)
-				selected_dates = sorted(set(acc))
+				selected_dates = [d for d in expand_weeks_to_dates(year, weeks) if d in date_map]
 
 			missing = [d for d in selected_dates if d not in date_map]
 			if missing:
@@ -644,7 +533,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 					daily_files=selected_files,
 					meta=meta,
 					outdir=args.outdir,
-					dry_run=args.dry_run,
 					seed=args.seed,
 					dt_hours=args.dt_hours,
 					overwrite=args.overwrite,

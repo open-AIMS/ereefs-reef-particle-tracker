@@ -42,9 +42,17 @@ from typing import Sequence, List
 
 import numpy as np
 import pandas as pd
-import xarray as xr
 import geopandas as gpd
 from shapely.geometry import Point
+
+from utils import (
+    sanitize_name,
+    make_week_tag,
+    load_reef_layer,
+    build_label_name_map,
+    load_parcels_zarr,
+    discover_week_tags,
+)
 
 
 def configure_logging() -> None:
@@ -98,38 +106,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.reef_shp.exists():
         logging.error('Reef shapefile not found: %s', args.reef_shp)
         return 2
-    reefs = gpd.read_file(args.reef_shp)
-    if 'LABEL_ID' not in reefs.columns or 'GBR_NAME' not in reefs.columns:
-        logging.error('Reef file missing required columns')
+    try:
+        reefs = load_reef_layer(args.reef_shp)
+    except Exception as e:
+        logging.error(str(e))
         return 3
-    ref = reefs.drop_duplicates(subset=['LABEL_ID']).set_index('LABEL_ID')['GBR_NAME'].to_dict()
+    ref = build_label_name_map(reefs)
     if args.id not in ref:
         logging.error('LABEL_ID %s not present in reef layer', args.id)
         return 4
     gbr_name = ref[args.id]
-    safe = ''.join(c if c.isalnum() or c in ('_','-') else '_' for c in gbr_name.replace(' ','_'))
+    safe = sanitize_name(gbr_name)
     week_tag = derive_week_tag(args.week, args.week_range)
 
     # If user omitted explicit weeks (week_tag == 'all') but no 'all' file exists, attempt auto-discovery.
-    zarr_path = args.outdir / args.id / str(args.year) / f"{safe}_{args.id}_k{args.k_index}_{args.year}{week_tag}_particles.zarr"
+    zarr_dir = args.outdir / args.id / str(args.year)
+    zarr_path = zarr_dir / f"{safe}_{args.id}_k{args.k_index}_{args.year}{week_tag}_particles.zarr"
     if week_tag == 'all' and not zarr_path.exists():
-        parent = args.outdir / args.id / str(args.year)
-        pattern = f"{safe}_{args.id}_k{args.k_index}_{args.year}w*_particles.zarr"
-        matches = sorted(parent.glob(pattern)) if parent.exists() else []
-        if len(matches) == 1:
-            logging.info("Auto-detected single weekly run %s", matches[0].name)
-            zarr_path = matches[0]
-            # Derive week tag from filename
-            stem = zarr_path.name
-            # extract ..._{year}wXX(-wYY)?_particles.zarr
-            try:
-                after_year = stem.split(f"_{args.year}",1)[1]
-                wk_part = after_year.split('_particles',1)[0]
-                week_tag = wk_part  # includes leading w
-            except Exception:
-                pass
-        elif len(matches) > 1:
-            logging.error('Multiple week-tagged Zarr stores found but none named all; specify --week/--week-range. Candidates: %s', [m.name for m in matches])
+        candidates = discover_week_tags(zarr_dir, safe, args.id, args.year, args.k_index)
+        if len(candidates) == 1:
+            week_tag = candidates[0]
+            zarr_path = zarr_dir / f"{safe}_{args.id}_k{args.k_index}_{args.year}{week_tag}_particles.zarr"
+            logging.info("Auto-detected week tag '%s' -> %s", week_tag, zarr_path.name)
+        elif len(candidates) > 1:
+            logging.error('Multiple candidate week tags found %s; specify --week/--week-range', candidates)
             return 5
     if not zarr_path.exists():
         logging.error('Zarr store not found: %s', zarr_path)
@@ -145,63 +145,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if p.exists():
                 p.unlink()
 
-    logging.info('Opening trajectory Zarr %s', zarr_path)
-    ds = xr.open_zarr(str(zarr_path))
-    try:
-        if 'lon' not in ds or 'lat' not in ds:
-            raise SystemExit('lon/lat variables missing in trajectory dataset')
-        lons = ds['lon'].values
-        lats = ds['lat'].values
-        raw_time = ds['time'].values if 'time' in ds.variables else None
-    finally:
-        ds.close()
-
-    # Flatten shapes (traj, obs) -> (traj*obs)
-    lons = np.asarray(lons)
-    lats = np.asarray(lats)
-    if lons.ndim > 1:
-        lons = lons.reshape(-1)
-        lats = lats.reshape(-1)
-    # Time flatten
-    times_list: List[pd.Timestamp] = []
-    if raw_time is not None:
-        raw_time = np.asarray(raw_time)
-        if raw_time.ndim > 1:
-            raw_time = raw_time.reshape(-1)
-        try:
-            times_list = pd.to_datetime(raw_time).to_pydatetime().tolist()  # type: ignore[arg-type]
-        except Exception:
-            times_list = []
-    if not times_list:
-        # reconstruct sequential starting from first non-NaT if present or 0 index fallback
-        base = pd.Timestamp.utcnow().tz_localize('UTC')
-        times_list = [base + timedelta(hours=args.dt_hours*i) for i in range(len(lons))]
-    if len(times_list) == 1 and len(lons) > 1:
-        base = times_list[0]
-        times_list = [base + timedelta(hours=args.dt_hours*i) for i in range(len(lons))]
-
-    # Ensure tz aware UTC
-    norm: List[pd.Timestamp] = []
-    for i,t in enumerate(times_list):
-        if isinstance(t, pd.Timestamp):
-            if t.tzinfo is None:
-                t = t.tz_localize('UTC')
-            else:
-                t = t.tz_convert('UTC')
-        else:
-            try:
-                t = pd.Timestamp(t)
-                if t.tzinfo is None:
-                    t = t.tz_localize('UTC')
-            except Exception:
-                t = pd.Timestamp.utcnow().tz_localize('UTC') + pd.Timedelta(hours=i)
-        norm.append(t)
-    bris = pd.DatetimeIndex(norm).tz_convert('Australia/Brisbane')
+    logging.info('Opening trajectory %s', zarr_path)
+    traj = load_parcels_zarr(zarr_path, assume_dt_hours=args.dt_hours)
+    # Convert to Australia/Brisbane timezone
+    bris = traj.time.tz_convert('Australia/Brisbane')
     iso_times = [t.isoformat() for t in bris]
-
-    if len(lons) != len(lats) or len(lons) != len(iso_times):
-        m = min(len(lons), len(lats), len(iso_times))
-        lons = lons[:m]; lats = lats[:m]; iso_times = iso_times[:m]
+    lons = traj.lon
+    lats = traj.lat
 
     gdf = gpd.GeoDataFrame(
         {
