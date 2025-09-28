@@ -1,30 +1,28 @@
 #!/usr/bin/env python
-"""
-Plot particle trajectory outputs produced by 04-basic-particle-flow.py.
+"""Config-driven plotting of particle simulations (daily-depth naming).
+
+Refactored to use shared TOML config (same file as extractor / simulator). Weeks are deprecated; this
+script discovers simulation Zarr outputs based on the new depth-inclusive filename pattern created by
+`utils.simulation_filename` used in `04-basic-particle-flow.py`:
+
+        {model_name}_{LABEL_ID}_particles_{depthToken}_{startDateYYYYMMDD}_{runLengthDays}d.zarr
 
 Features:
-- Select reefs by LABEL_ID, years, ordinal weeks, and k-index to match naming.
-- Automatically reconstruct the particle Zarr directory path(s) used in 04.
-- Load lon/lat/time from the Zarr output and plot all trajectory points as small dots.
-- Overlay the reef outline polygon(s) (full geometry subset to selected LABEL_IDs; if multiple IDs use all chosen).
-- Optionally color points by elapsed time.
+    * Loads the same TOML config (ids, years, depth_m, model_name, data_root/traces_root, date_periods optional)
+    * Discovers simulation Zarr stores per reef/year by globbing for the above pattern
+    * Loads lon/lat/time via `utils.load_parcels_zarr`
+    * Plots trajectory as dots (optionally coloured by relative time progression)
+    * Overlays reef polygon geometry for context
+    * Writes PNG next to the Zarr with suffix `_track.png`
 
-Assumptions:
-- Output directory structure: working/02/<LABEL_ID>/<YEAR>/<SAFE_NAME>_<LABEL_ID>_k<kindex>_<YEAR><week_tag>_particles.zarr
-  where week_tag is either 'wNN' or 'wNN-wMM' or 'all' when all weeks were run.
-- Zarr contains variables lon, lat (1D or 2D). If 2D (time, particle) flatten is applied.
-- Time may be 1D with same length as lon/lat or shorter; if missing, an index-based time is synthesized.
+Assumptions / Notes:
+    * Single-particle simulations (current workflow); multi-particle will just flatten all positions
+    * Zarr layout `(trajectory, obs)` or flattened; loader normalises
+    * Time axis hourly; relative colour mapping uses first->last timestamp
+    * If multiple simulation Zarrs exist for a reef/year (e.g., different start dates), all are plotted
+    * Config `date_periods` is not used for filtering here (plots what exists)
 
-Week semantics:
-- Weeks follow the ordinal definition from script 04: Jan1-Jan7 = week 1, next 7-day blocks sequential.
-- If multiple week numbers supplied they are consolidated into a single tag matching 04's scheme.
-
-Output:
-- Saves PNG(s) to <outdir>/<LABEL_ID>/<YEAR>/<...>_track.png with same base pattern as trajectory.
-- Can optionally show interactive window when --show is set.
-
-Limitations:
-- Designed for single-particle runs; multi-particle flattening will show all points without differentiation.
+CLI now only accepts --config plus optional `--color-time`, `--show`, `--log-file`.
 """
 from __future__ import annotations
 
@@ -32,24 +30,19 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Sequence, List, Dict
+from typing import Sequence
 
 import numpy as np
-import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 
 from utils import (
     configure_logging,
-    sanitize_name,
-    normalize_years,
-    normalize_weeks,
-    make_week_tag,
-    load_reef_layer as load_reef_layer_util,
-    build_label_name_map,
+    load_config,
     load_parcels_zarr,
-    discover_week_tags,
-    particles_zarr_path,
+    load_reef_layer,
+    build_label_name_map,
+    depth_token,
 )
 
     # (All helper implementations replaced by centralized utilities from utils.py)
@@ -87,16 +80,11 @@ def plot_run(lon, lat, times, reef_gdf: gpd.GeoDataFrame, out_png: Path, label_i
 # ---------------- Argument Parsing ----------------
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Plot particle trajectories produced by 04-basic-particle-flow.py", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p = argparse.ArgumentParser(description="Plot particle trajectories (config-only daily-depth naming)")
+    p.add_argument('--config', required=True, type=Path, help='Path to TOML config used for simulation')
     p.add_argument('--reef-shp', type=Path, default=Path('data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp'))
-    p.add_argument('--ids', nargs='+', required=True, help='LABEL_ID values to plot.')
-    p.add_argument('--years', nargs='+', type=int, required=True, help='Year or inclusive range (two numbers).')
-    p.add_argument('--weeks', nargs='*', type=int, default=None, help='Ordinal week numbers (Jan1-Jan7=1 ...).')
-    p.add_argument('--k-index', type=int, default=40, help='Vertical index to match simulation output naming.')
-    p.add_argument('--outdir', type=Path, default=Path('working/02'), help='Root directory where particle outputs were written.')
-    p.add_argument('--color-time', action='store_true', help='Color points by relative time progression.')
-    p.add_argument('--assume-dt-hours', type=float, default=1.0, help='Assumed dt hours when reconstructing times (if only single timestamp present).')
-    p.add_argument('--show', action='store_true', help='Display plot window instead of only saving PNG.')
+    p.add_argument('--color-time', action='store_true', help='Colour points by relative time progression')
+    p.add_argument('--show', action='store_true', help='Display plot window instead of only saving PNG')
     p.add_argument('--log-file', type=Path, default=None)
     return p.parse_args(argv)
 
@@ -104,64 +92,53 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    configure_logging(args.log_file)
-    logging.info("Starting trajectory plotting")
-
+    # Load config first (logging file may be specified there)
+    cfg = load_config(args.config)
+    # CLI log_file overrides config if provided
+    log_file = args.log_file if args.log_file else cfg.log_file
+    configure_logging(log_file)
+    logging.info("Starting trajectory plotting (config-driven)")
+    # Reef layer
     try:
-        years = normalize_years([int(v) for v in args.years]) if isinstance(args.years[0], str) else normalize_years(args.years)
-    except Exception as e:  # noqa: BLE001
-        logging.error("Invalid years specification: %s", e)
-        return 2
-    try:
-        weeks = normalize_weeks(args.weeks)
-    except ValueError as e:  # noqa: BLE001
-        logging.error(str(e))
-        return 3
-    # Load reef layer through utils (keeps logic consistent in one place)
-    try:
-        reef_gdf = load_reef_layer_util(args.reef_shp)
+        reef_gdf = load_reef_layer(args.reef_shp)
     except Exception as e:  # noqa: BLE001
         logging.error("Failed to load reef layer: %s", e)
         return 5
-    name_map: Dict[str, str] = build_label_name_map(reef_gdf)
-
-    # Decide week tags: if weeks supplied, single consolidated tag. If not, discover all *_w??*_particles.zarr for each reef/year.
-    explicit_week_tag = make_week_tag(weeks)
-    logging.info("Requested week tag (explicit or placeholder): %s", explicit_week_tag)
-
+    name_map = build_label_name_map(reef_gdf)
+    depth_tok = depth_token(cfg.depth_m)
     any_plotted = False
-    for rid in args.ids:
+    for rid in cfg.ids:
         if rid not in name_map:
-            logging.warning("LABEL_ID %s not found in reef file; skipping", rid)
+            logging.warning("LABEL_ID %s not in reef layer; skipping", rid)
             continue
         gbr_name = name_map[rid]
-        safe_name = sanitize_name(gbr_name)
-        for year in years:
-            if weeks:
-                # Use the consolidated explicit tag only
-                tags_to_plot = [explicit_week_tag]
-            else:
-                # Discover via utility
-                yr_dir = args.outdir / rid / str(year)
-                tags_to_plot = discover_week_tags(yr_dir, safe_name, rid, year, args.k_index) or [explicit_week_tag]
-
-            for tag in tags_to_plot:
-                zarr_dir = particles_zarr_path(args.outdir, rid, year, safe_name, args.k_index, tag)
-                if not zarr_dir.exists():
-                    logging.warning("Missing trajectory directory: %s", zarr_dir)
-                    continue
+        for year in cfg.years:
+            # Glob all simulation zarr stores for this reef/year matching new pattern
+            year_dir = cfg.traces_root / rid / str(year)
+            if not year_dir.exists():
+                logging.info("Year dir missing: %s", year_dir)
+                continue
+            pattern = f"{cfg.model_name}_{rid}_particles_{depth_tok}_*_*.zarr"
+            matches = sorted(year_dir.glob(pattern))
+            if not matches:
+                logging.info("No simulations found for %s %d", rid, year)
+                continue
+            for zpath in matches:
                 try:
-                    traj = load_parcels_zarr(zarr_dir, assume_dt_hours=args.assume_dt_hours)
-                    lon, lat, times = traj.lon, traj.lat, traj.time
-                except SystemExit as e:
-                    logging.error(str(e))
+                    traj = load_parcels_zarr(zpath, assume_dt_hours=cfg.dt_hours)
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("Failed to load %s: %s", zpath, e)
                     continue
-                png_path = zarr_dir.with_name(zarr_dir.name.replace('_particles.zarr', f'_{tag}_track.png') if tag not in zarr_dir.name else zarr_dir.name.replace('_particles.zarr','_track.png'))
-                plot_run(lon, lat, times, reef_gdf, png_path, rid, gbr_name, show=args.show, color_time=args.color_time)
+                # Derive output plot path: if plots_root configured, mirror directory structure there
+                if getattr(cfg, 'plots_root', None):
+                    rel = zpath.relative_to(cfg.traces_root)
+                    png_path = cfg.plots_root / rel.parent / rel.name.replace('.zarr', '_track.png')
+                else:
+                    png_path = zpath.with_name(zpath.name.replace('.zarr','_track.png'))
+                plot_run(traj.lon, traj.lat, traj.time, reef_gdf, png_path, rid, gbr_name, show=args.show, color_time=args.color_time)
                 any_plotted = True
-
     if not any_plotted:
-        logging.error("No plots produced (check inputs / outputs exist)")
+        logging.error("No plots produced (check simulation outputs exist)")
         return 4
     logging.info("All plotting completed")
     return 0

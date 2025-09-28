@@ -1,103 +1,107 @@
-"""
-utils.py - Shared helper functions for the eReefs particle / extraction workflow.
+"""utils.py - Shared helper functions for the eReefs extraction / particle workflow.
 
-LLM PRIMER / QUICK ORIENTATION
-================================
-Purpose: This single file centralizes every cross-cutting helper so large language models (and humans) can reason about the codebase without chasing many tiny modules. Import from here instead of redefining helpers in scripts.
+UPDATED ORIENTATION (Depth + Date Period Era)
+=============================================
+This module centralises all cross-cutting helpers (config loading, naming, trajectory I/O, legacy week
+utilities) so scripts 03 / 04 / 05 remain thin orchestration layers. New depth-aware / date-period
+conventions co‑exist with legacy week naming for backward compatibility.
 
-WHEN TO IMPORT WHAT (Cheat Sheet)
----------------------------------
-Logging:
+PRIMARY GROUPS (import what you need)
+-------------------------------------
+Logging
     configure_logging(log_file=None, level=INFO) -> None
-            Call once at the start of a CLI script to standardize log formatting and optional file logging.
+        Uniform console/file logging set‑up (call exactly once per CLI).
 
-Naming & Paths:
-    sanitize_name(name) -> str
-            Convert a reef / human name to a safe token used in filenames.
+Modern Naming (depth + period based)
+    depth_token(depth_m) -> str
+        Format target depth with sign, <=2 decimals, trailing zeros trimmed, suffixed 'm' (e.g. -2.35m, -2m).
+    simulation_filename(root, model_name, label_id, depth_m, start_date, length_days) -> Path
+        New particle simulation Zarr path pattern:
+            {model_name}_{LABEL_ID}_particles_{depthToken}_{YYYYMMDD}_{Nd}.zarr
+        (Used by script 04; discovered by script 05.)
+    png_path_from_stem / shapefile_path / make_output_stem
+        Retained for legacy week-based stems (converter or archival workflows).
+
+Legacy Week Naming (kept temporarily)
     make_output_stem(safe_name, label_id, k_index, year, week_tag) -> str
-            Core stem used for ALL particle-related derivative files; keep naming consistent.
     particles_zarr_path(root, label_id, year, safe_name, k_index, week_tag) -> Path
-            Construct canonical Zarr output directory path written by simulation script (04).
-    shapefile_path(root, stem, suffix='track') -> Path
-            Build shapefile export path (used by converter script 04b).
-    png_path_from_stem(root, stem, suffix='track') -> Path
-            Derive PNG path for plots (script 05) based on the common stem.
+    discover_week_tags(...), make_week_tag(...), normalize_weeks(...)
+        These support earlier week-sliced simulations. Marked for deprecation once all downstream
+        tooling migrates to date periods + explicit runtime / start-day semantics.
 
-Year / Week Utilities:
+Date / Period Utilities
     normalize_years(list[int]) -> list[int]
-            Expand a 1- or 2-length list (range endpoints) or deduplicate many years into a sorted list.
-    normalize_weeks(list[int]|None) -> list[int]|None
-            Same expansion semantics for ordinal weeks (1 = Jan1-Jan7). Returns None if input empty/None.
-    make_week_tag(weeks|None) -> str
-            Turn a list of weeks into naming token: 'all', 'wNN', or 'wNN-wMM'. Use for file names not for logic.
-    ordinal_week_for_date(date) -> int
-            Convert a Python date into the ordinal week number used by the pipeline (7-day fixed blocks).
-    expand_weeks_to_dates(year, weeks) -> list[date]
-            Produce actual calendar dates (limited to same year) for the given ordinal week numbers.
+        Expand 2-value inclusive range or deduplicate arbitrary list.
+    normalize_date_periods(raw) -> list[str] | None
+        Accept single string or list (e.g. "Jan01-Apr30"). Returns validated canonical strings.
+    expand_date_periods_for_year(year, specs) -> list[date]
+        Expand each specification to concrete dates inside the given year (wrap portions truncated).
+    make_period_tag(specs|None) -> str
+        Compact descriptor (e.g. Jan01-Apr30+Nov15-Dec31 or 'all').
 
-Reef Metadata:
+Reef Metadata
     load_reef_layer(path) -> GeoDataFrame
-            Lazy-load heavy geopandas dependency; validates required columns.
-    build_label_name_map(gdf) -> dict[label_id -> GBR_NAME]
-            Helper to quickly map LABEL_ID to reef display name.
+        Validates presence of LABEL_ID & GBR_NAME. Heavy import done lazily.
+    build_label_name_map(gdf) -> dict
+        Quick LABEL_ID -> GBR_NAME mapping.
 
-Trajectory Loading & Time Helpers:
+Trajectory / Time Handling
     Trajectory dataclass(lon, lat, time)
-            Simple container used across scripts for uniform attribute access.
     load_parcels_zarr(store, assume_dt_hours=1.0) -> Trajectory
-            Robust reader for Parcels output stored as Zarr (single or (traj, obs) forms). Reconstructs or extends time sequence if missing or underspecified and always returns UTC tz-aware timestamps.
-    ensure_utc(pd.Timestamp) -> pd.Timestamp
-            Normalize any timestamp to UTC (tz-localize or convert).
-    reconstruct_times(base_ts, count, dt_hours) -> list[pd.Timestamp]
-            Generate evenly spaced UTC timestamps, mainly used internally when time reconstruction needed.
+        Robust against flattened vs (traj, obs) layouts; reconstructs time axis if absent/underspecified.
+    ensure_utc(ts), reconstruct_times(base, count, dt_hours)
+        Guarantee UTC-normalised monotonically spaced DateTimeIndex.
 
-Discovery:
-    discover_week_tags(dir, safe_name, label_id, year, k_index) -> list[str]
-            Scan a year directory for week-tagged particle Zarr outputs, returning tokens like 'w03' or 'all'.
-    auto_detect_single_week(requested_tag, candidates) -> str
-            If multiple candidates exist and requested_tag == 'all', choose best available (first or 'all').
+Config & Parameters
+    Config dataclass fields include: ids, years, weeks (legacy), date_periods, depth_m, k_index,
+    data_root (daily subcubes), traces_root (particle simulations), plots_root (optional plot output root),
+    opendap_url, dt_hours, runtime, overwrite, integrator, shrink_margin, log_file, buffer_km.
+    load_config(path) -> Config
+        TOML reader supporting single-string or list date_periods.
 
-Design Notes:
-    - Single file for simplicity & LLM discoverability.
-    - Heavy / optional deps (geopandas, xarray) are imported lazily inside functions.
-    - All times returned from trajectory loader are UTC tz-aware.
-    - Functions have minimal side effects (only logging).
-    - Scripts 03/04/04b/05 should import these to avoid drift / duplication.
+Error & Design Philosophy
+    * Pure path builders (no filesystem effects). Callers decide mkdir/exists semantics.
+    * Fail early with clear ValueError / FileNotFoundError; CLI wrappers convert to user-facing messages.
+    * Heavy deps (geopandas, xarray) loaded only when needed.
+    * UTC everywhere for temporal data; attribute enrichment done at write points (scripts 03 & 04).
 
-Patterns / Naming Contract:
-    Filename stem = {safe}_{LABEL_ID}_k{k}_{YEAR}{week_tag}
-    Zarr directory = stem + '_particles.zarr'
-    Derived exports (PNG/shape) append '_track.(png|shp)' using the same stem.
+Current Naming Contracts
+    DAILY SUBCUBES (script 03; under data_root):
+        {model_name}_{LABEL_ID}_UV_{depthToken}_{YYYYMMDD}.nc
+    PARTICLE ZARR (script 04; under traces_root):
+        {model_name}_{LABEL_ID}_particles_{depthToken}_{YYYYMMDD}_{Nd}.zarr
+    PLOTS (script 05; under plots_root if set else traces_root):
+        *_track.png
+    (Legacy week form retained internally: {safe}_{LABEL_ID}_k{k}_{YEAR}{week_tag}_particles.zarr)
 
-Extensibility Guidance (for future contributors / LLMs):
-    - When adding a new artifact type (e.g., CSV summary), derive its path from make_output_stem to remain discoverable.
-    - Prefer adding new small helpers here rather than re-implementing ad-hoc logic in scripts.
-    - Keep parameter names consistent (label_id, safe_name, week_tag) to reduce confusion.
+Examples
+    from utils import depth_token, simulation_filename
+    tok = depth_token(-2.35)               # -> '-2.35m'
+    zpath = simulation_filename(Path('working/02'), 'gbr1', '18-096', -2.35, date(2016,1,1), 3)
+    # working/02/18-096/2016/gbr1_18-096_particles_-2.35m_20160101_3d.zarr
 
-Error Philosophy:
-    - Path builders never hit the filesystem (pure functions); callers decide to mkdir.
-    - Loaders raise standard exceptions (FileNotFoundError, ValueError). CLI layers catch & log.
-    - Discovery returns an empty list instead of raising; caller decides fallback.
+Deprecation Roadmap
+    Week-based helpers will be pruned after remaining converters & plotters migrate fully to
+    period + depth naming. Until then, they remain stable but clearly partitioned.
 
-Examples (illustrative, not executed here):
-    from utils import particles_zarr_path, sanitize_name, make_week_tag
-    safe = sanitize_name('Davies Reef')
-    tag = make_week_tag([3,4,5])  # -> 'w03-w05'
-    zpath = particles_zarr_path(Path('working/02'), '18-096', 2016, safe, 40, tag)
-    # working/02/18-096/2016/Davies_Reef_18-096_k40_2016w03-w05_particles.zarr
-
-This primer is intentionally verbose to aid LLM reasoning: do not shorten without retaining the above semantic map.
+This docstring is intentionally verbose to aid both human and LLM comprehension; keep structural
+sections intact if editing.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Sequence, Optional
 import logging
+import textwrap
 import sys
 import numpy as np
 import pandas as pd
 from datetime import date, timedelta
+try:
+    import tomllib  # Python 3.11+
+except Exception:  # noqa: BLE001
+    tomllib = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # 1. Logging
@@ -140,6 +144,16 @@ def shapefile_path(root: Path, stem: str, suffix: str = 'track') -> Path:
 
 def png_path_from_stem(root: Path, stem: str, suffix: str = 'track') -> Path:
     return root / f"{stem}_{suffix}.png"
+
+# New depth & simulation naming (daily extraction already embeds depth token pattern); depth token keeps sign
+def depth_token(depth_m: float) -> str:
+    s = f"{depth_m:.2f}".rstrip('0').rstrip('.')
+    return f"{s}m"
+
+def simulation_filename(root: Path, model_name: str, label_id: str, depth_m: float, start_date, length_days: int) -> Path:  # start_date: date
+    tok = depth_token(depth_m)
+    stem = f"{model_name}_{label_id}_particles_{tok}_{start_date:%Y%m%d}_{length_days}d.zarr"
+    return root / label_id / f"{start_date.year}" / stem
 
 # ---------------------------------------------------------------------------
 # 3. Year / Week Utilities
@@ -275,6 +289,178 @@ def load_parcels_zarr(store: Path, assume_dt_hours: float = 1.0) -> Trajectory:
     return Trajectory(lon=lon, lat=lat, time=pd.DatetimeIndex(norm))
 
 # ---------------------------------------------------------------------------
+# 6. Config (new minimal implementation to support runtime & log file)
+
+@dataclass
+class Config:
+    ids: List[str]
+    years: List[int]
+    # Mutually exclusive legacy weeks vs new date_periods (date_periods takes precedence when provided)
+    weeks: Optional[List[int]]
+    date_periods: Optional[List[str]]  # raw period specs like "Jan01-Apr30", "Nov15-Dec31"
+    model_name: str
+    depth_m: float
+    k_index: int
+    data_root: Path
+    traces_root: Path  # directory for simulation (particle) outputs
+    plots_root: Path | None  # optional separate root for plots (falls back to traces_root if None)
+    opendap_url: str
+    fnode_nc: Path
+    dt_hours: float = 1.0
+    runtime: Optional[float] = None
+    overwrite: bool = False
+    integrator: str = 'rk4'
+    shrink_margin: int = 1
+    log_file: Optional[Path] = None
+    buffer_km: float = 0.0
+
+MONTH_MAP = {m.lower(): i for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], start=1)}
+
+def _parse_month_day(token: str) -> tuple[int,int]:
+    if len(token) < 5:
+        raise ValueError(f"Invalid month-day token: {token}")
+    mon_part = token[:3].lower()
+    day_part = token[3:]
+    if mon_part not in MONTH_MAP:
+        raise ValueError(f"Invalid month abbreviation in {token}")
+    day = int(day_part)
+    if not 1 <= day <= 31:
+        raise ValueError(f"Invalid day in {token}")
+    return MONTH_MAP[mon_part], day
+
+def normalize_date_periods(raw_periods) -> List[str] | None:  # type: ignore[override]
+    """Normalize date_periods from TOML input.
+
+    Accepts:
+      - None / empty -> None
+      - Single string: "Jan01-Apr30"
+      - List of strings
+    Returns cleaned list preserving original order (deduplicated) or None.
+    """
+    if raw_periods is None:
+        return None
+    # If a single string was supplied in TOML, tomllib returns str not list.
+    if isinstance(raw_periods, str):
+        raw_list = [raw_periods]
+    else:
+        raw_list = list(raw_periods)
+    cleaned: List[str] = []
+    for spec in raw_list:
+        if spec is None:
+            continue
+        spec = str(spec).strip()
+        if not spec:
+            continue
+        if '-' not in spec:
+            raise ValueError(f"Date period must contain '-' (start-end), got '{spec}'")
+        start_tok, end_tok = spec.split('-',1)
+        _parse_month_day(start_tok)
+        _parse_month_day(end_tok)
+        cleaned.append(f"{start_tok}-{end_tok}")
+    seen = set(); out: List[str] = []
+    for c in cleaned:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out or None
+
+def expand_date_periods_for_year(year: int, period_specs: List[str]) -> List[date]:
+    """Expand period specs into concrete date list for the given year.
+
+    Handles wrap-around if end < start by spanning year boundary, but truncates outside 'year'.
+    Example: Dec15-Jan10 yields Dec15..Dec31 of 'year' only (future year days ignored here). Multiple years should be processed separately.
+    """
+    days: set[date] = set()
+    for spec in period_specs:
+        start_tok, end_tok = spec.split('-',1)
+        sm, sd = _parse_month_day(start_tok)
+        em, ed = _parse_month_day(end_tok)
+        import calendar
+        # Helper to clamp invalid day at month end (defensive for 30/31 mismatches like Apr31)
+        def _mk(y: int, m: int, d: int) -> date:
+            last = calendar.monthrange(y,m)[1]
+            if d>last:
+                d=last
+            return date(y,m,d)
+        start = _mk(year, sm, sd)
+        end = _mk(year, em, ed)
+        if (em > sm) or (em==sm and ed >= sd):
+            cur = start
+            while cur <= end:
+                days.add(cur)
+                cur += timedelta(days=1)
+        else:  # wrap-around (e.g., Nov15-Feb10) -> add start..Dec31
+            cur = start
+            while cur.year == year:
+                days.add(cur)
+                cur += timedelta(days=1)
+            # Do not add next-year portion here; handled when calling for next year.
+    return sorted(days)
+
+def make_period_tag(period_specs: List[str] | None) -> str:
+    if not period_specs:
+        return 'all'
+    # Canonical condensed form: Jan01-Apr30+Nov15-Dec31 (keep original order)
+    return "+".join(period_specs)
+
+def load_config(path: Path) -> Config:
+    if tomllib is None:
+        raise RuntimeError("tomllib not available; need Python 3.11+ for config loading")
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open('rb') as f:
+        raw = tomllib.load(f)
+    def _req(key: str):
+        if key not in raw:
+            raise ValueError(f"Missing required config key: {key}")
+        return raw[key]
+    ids = list(map(str, _req('ids')))
+    years = list(map(int, _req('years')))
+    weeks = raw.get('weeks')
+    if weeks is not None:
+        weeks = [int(w) for w in weeks]
+    date_periods = normalize_date_periods(raw.get('date_periods')) if 'date_periods' in raw else None
+    model_name = str(raw.get('model_name', 'gbr1'))
+    depth_m = float(raw.get('depth_m', -2.35))
+    opendap_url = str(raw.get('opendap_url', 'https://thredds.nci.org.au/thredds/dodsC/fx3/model_data/gbr1_2.0.ncml'))
+    fnode_nc = Path(raw.get('fnode_nc', 'working/02/gbr1_fnodes.nc'))
+    k_index = int(raw.get('k_index', 40))
+    data_root = Path(raw.get('data_root', 'working/03-data'))
+    traces_root = Path(raw.get('traces_root', 'working/04-traces'))
+    plots_root_raw = raw.get('plots_root')
+    plots_root = Path(plots_root_raw) if plots_root_raw else None
+    dt_hours = float(raw.get('dt_hours', 1.0))
+    runtime = raw.get('runtime')
+    runtime = float(runtime) if runtime is not None else None
+    overwrite = bool(raw.get('overwrite', False))
+    integrator = str(raw.get('integrator', 'rk4')).lower()
+    shrink_margin = int(raw.get('shrink_margin', 1))
+    log_file_raw = raw.get('log_file')
+    log_file = Path(log_file_raw) if log_file_raw else None
+    buffer_km = float(raw.get('buffer_km', 0.0))
+    cfg = Config(
+        ids=ids,
+        years=years,
+        weeks=weeks,
+        date_periods=date_periods,
+        model_name=model_name,
+        depth_m=depth_m,
+        k_index=k_index,
+        data_root=data_root,
+    traces_root=traces_root,
+    plots_root=plots_root,
+        opendap_url=opendap_url,
+        fnode_nc=fnode_nc,
+        dt_hours=dt_hours,
+        runtime=runtime,
+        overwrite=overwrite,
+        integrator=integrator,
+        shrink_margin=shrink_margin,
+        log_file=log_file,
+        buffer_km=buffer_km,
+    )
+    return cfg
+
+
 # 7. Discovery
 # ---------------------------------------------------------------------------
 
@@ -309,5 +495,6 @@ __all__ = [
     'configure_logging','sanitize_name','make_output_stem','particles_zarr_path','shapefile_path','png_path_from_stem',
     'normalize_years','normalize_weeks','make_week_tag','ordinal_week_for_date','expand_weeks_to_dates',
     'load_reef_layer','build_label_name_map','Trajectory','load_parcels_zarr','reconstruct_times','ensure_utc',
-    'discover_week_tags','auto_detect_single_week'
+    'discover_week_tags','auto_detect_single_week','Config','load_config',
+    'normalize_date_periods','expand_date_periods_for_year','make_period_tag','depth_token','simulation_filename'
 ]
