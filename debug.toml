@@ -2,9 +2,8 @@
 # Prefer date_periods; weeks retained temporarily for backward compatibility.
 ids = ["18-096"]            # List of LABEL_ID reef identifiers "18-096"
 years = [2016]                # Either [YEAR] or list e.g. [2015,2016]
-# weeks = [3,4,5]             # (legacy) Ordinal weeks; leave commented when using date_periods
 # Date periods use fixed 3-letter month + day (Jan01-Apr30). Multiple periods allowed.
-date_periods = "Jan01-Jan01"
+date_periods = "Jan01-Jan03"
 model_name = "gbr1_2.0"           # Short model identifier for naming
 depth_m = -2.35               # Target depth (m, negative downward) used to choose nearest k
 buffer_km = 10
@@ -15,7 +14,7 @@ plots_root = "working/05-plots"
 opendap_url = "https://thredds.nci.org.au/thredds/dodsC/fx3/model_data/gbr1_2.0.ncml"
 # fnode_nc = "working/02/gbr1_fnodes.nc"  # Precomputed f-node grid
 dt_hours = 0.1                # Integration timestep (hours)
-runtime = 12                # Optional max runtime (hours)
+runtime = 48                # Optional max runtime (hours)
 overwrite = true             # Overwrite existing outputs if true
 integrator = "rk4"            # rk4 or euler
 shrink_margin = 1             # Interior margin for seeding

@@ -41,6 +41,7 @@ from utils import (
 )
 
 from parcels import FieldSet, ParticleSet, JITParticle, AdvectionRK4
+import parcels  # needed for parcels.StatusCode in DeleteParticle handler
 try:  # noqa: SIM105
     from parcels.tools.error import ErrorCode  # type: ignore
 except Exception:  # noqa: BLE001
@@ -125,7 +126,7 @@ def run_simulation(cfg) -> None:
     # Load reef names once
     reef_shp = Path("data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp")
     if not reef_shp.exists():
-        raise SystemExit(f"Reef shapefile missing: {reef_shp}")
+        raise SystemExit(f"Reef shapefile missing. Have you run 01-download: {reef_shp}")
     reefs = gpd.read_file(reef_shp)
     ref = reefs.drop_duplicates(subset=['LABEL_ID']).set_index('LABEL_ID')['GBR_NAME'].to_dict()
     depth_tok = depth_token(cfg.depth_m)
@@ -135,6 +136,7 @@ def run_simulation(cfg) -> None:
             log.warning("LABEL_ID %s not found in reef layer; skipping", label_id)
             continue
         for year in cfg.years:
+            # ---------- Create a map of all daily files for this reef/year --------
             daily_files = discover_daily_files(cfg.data_root, label_id, year, cfg.model_name, depth_tok)
             if not daily_files:
                 log.warning("No daily files for %s %d", label_id, year)
@@ -148,6 +150,7 @@ def run_simulation(cfg) -> None:
                     date_map[d] = p
                 except Exception:
                     continue
+            # ------------ Find the date_periods files with the map ------------
             if cfg.date_periods:
                 days_allowed = set(expand_date_periods_for_year(year, cfg.date_periods))
                 selected_days = sorted(d for d in date_map if d in days_allowed)
@@ -157,18 +160,46 @@ def run_simulation(cfg) -> None:
                 log.warning("No days selected after period filtering for %s %d", label_id, year)
                 continue
             selected_files = [date_map[d] for d in selected_days]
+
             meta = load_subcube_meta(selected_files[0])
             # Build fieldset
             fieldset = build_fieldset(selected_files, meta)
-            # Start/end times
-            ds_cat = xr.open_mfdataset([str(p) for p in selected_files], combine='by_coords')
+            
+            # Efficient determination of overall time span: open only first and last daily file
             try:
-                times = pd.to_datetime(ds_cat['time'].values)
-                t_start = times.min()
-                t_end_full = times.max()
-            finally:
-                ds_cat.close()
-            runtime_hours = cfg.runtime if cfg.runtime is not None else (t_end_full - t_start).total_seconds()/3600.0
+                with xr.open_dataset(str(selected_files[0]), decode_times=True) as ds_first:
+                    t0_vals = pd.to_datetime(ds_first['time'].values)
+                    t_start = t0_vals.min()
+                with xr.open_dataset(str(selected_files[-1]), decode_times=True) as ds_last:
+                    tN_vals = pd.to_datetime(ds_last['time'].values)
+                    t_end_full = tN_vals.max()
+                # Sanity: ensure ordering
+                if t_end_full < t_start:
+                    raise ValueError("End time earlier than start time in optimized span computation")
+                # Optionally verify expected daily coverage when more than 1 day
+                # (Skip heavy validation; user requested lightweight approach)
+            except Exception as e:  # fallback to prior robust method
+                log.debug("Optimized time-span detection failed (%s); falling back to opening all files", e)
+                ds_cat = xr.open_mfdataset([str(p) for p in selected_files], combine='by_coords')
+                try:
+                    times = pd.to_datetime(ds_cat['time'].values)
+                    t_start = times.min()
+                    t_end_full = times.max()
+                finally:
+                    ds_cat.close()
+            available_hours = (t_end_full - t_start).total_seconds() / 3600.0
+            if cfg.runtime is not None:
+                if cfg.runtime > available_hours + 1e-6:  # allow tiny float tolerance
+                    log.warning(
+                        "Requested runtime %.2f h exceeds available data span %.2f h (start=%s end=%s). Using available span instead.",
+                        cfg.runtime, available_hours, t_start, t_end_full
+                    )
+                runtime_hours = min(cfg.runtime, available_hours)
+            else:
+                runtime_hours = available_hours
+            if runtime_hours <= 0:
+                log.warning("No positive runtime available for %s %d (span %.2f h); skipping", label_id, year, available_hours)
+                continue
             t_end = t_start + pd.Timedelta(hours=runtime_hours)
             sim_length_days = int(np.ceil(runtime_hours/24.0))
             out_path = simulation_filename(cfg.traces_root, cfg.model_name, label_id, cfg.depth_m, t_start.date(), sim_length_days)
@@ -193,39 +224,19 @@ def run_simulation(cfg) -> None:
             pset = ParticleSet.from_list(fieldset=fieldset, pclass=Particle, lon=[lon0], lat=[lat0], time=t_start.to_pydatetime())
             with contextlib.suppress(Exception):
                 pset.populate_indices()
-            # Domain constants for simple clamp kernel
-            finite_lon = lon_arr[mask]; finite_lat = lat_arr[mask]
-            for k,v in {
-                'DOM_MINLON': float(np.nanmin(finite_lon)),
-                'DOM_MAXLON': float(np.nanmax(finite_lon)),
-                'DOM_MINLAT': float(np.nanmin(finite_lat)),
-                'DOM_MAXLAT': float(np.nanmax(finite_lat)),
-            }.items():
-                try:
-                    fieldset.add_constant(k, v)
-                except Exception:
-                    pass
-            def Clamp(particle, fieldset, time):  # noqa: D401
-                if particle.lon < fieldset.DOM_MINLON: particle.lon = fieldset.DOM_MINLON
-                elif particle.lon > fieldset.DOM_MAXLON: particle.lon = fieldset.DOM_MAXLON
-                if particle.lat < fieldset.DOM_MINLAT: particle.lat = fieldset.DOM_MINLAT
-                elif particle.lat > fieldset.DOM_MAXLAT: particle.lat = fieldset.DOM_MAXLAT
-            if cfg.integrator == 'euler':
-                from parcels import AdvectionEE
-                base_adv = AdvectionEE
-            else:
-                base_adv = AdvectionRK4
-            kernel = pset.Kernel(base_adv) + pset.Kernel(Clamp)
-            # Use configured timestep for both integration (dt) and output cadence
+
             output_dt = timedelta(hours=cfg.dt_hours)
             log.debug("Simulation timesteps: integration=%.3f h output=%.3f h", cfg.dt_hours, cfg.dt_hours)
             pfile = pset.ParticleFile(name=str(out_path), outputdt=output_dt)
             try:
-                recovery_kwargs = {}
-                if ErrorCode is not None:
-                    try: recovery_kwargs['recovery'] = {ErrorCode.ErrorOutOfBounds: lambda p, f, t: p.delete()}
-                    except Exception: pass
-                pset.execute(kernel, runtime=timedelta(hours=runtime_hours), dt=timedelta(hours=cfg.dt_hours), output_file=pfile, verbose_progress=False, **recovery_kwargs)
+                def DeleteParticle(particle, fieldset, time):
+                    if particle.state == parcels.StatusCode.ErrorOutOfBounds:
+                        particle.delete()
+                pset.execute([AdvectionRK4,DeleteParticle], 
+                             runtime=timedelta(hours=runtime_hours), 
+                             dt=timedelta(hours=cfg.dt_hours), 
+                             output_file=pfile, 
+                             verbose_progress=False)
             finally:
                 with contextlib.suppress(Exception):
                     pfile.close()

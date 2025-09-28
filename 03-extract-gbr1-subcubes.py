@@ -3,13 +3,13 @@
 Generates one NetCDF per reef per day at target depth (nearest vertical level).
 
 Directory structure:
-    <outdir>/<LABEL_ID>/<YEAR>/<file>.nc
+    <data_root>/<LABEL_ID>/<YEAR>/<file>.nc
 Filename pattern (spec):
     {model_name}{label_id}UV{depthToken}{YYYYMMDD}.nc
   depthToken keeps sign, up to 2 decimals, suffixed with 'm' (e.g. -2.35m, -2m)
 
 Config keys (TOML):
-    REQUIRED: ids, years, model_name, depth_m, k_index, opendap_url, outdir
+    REQUIRED: ids, years, model_name, depth_m, k_index, opendap_url, data_root
     OPTIONAL: date_periods = ["Jan01-Apr30", "Nov15-Dec31"] (if omitted or empty => full year)
                         buffer_km = <float> (optional horizontal buffer applied around reef polygon when computing ij window; default 0)
 
@@ -230,7 +230,7 @@ def extract(cfg):  # noqa: C901
         safe_label = sanitize_name(str(reef_name))  # kept only for metadata
         for year in cfg.years:
             days = build_dates(year, cfg.date_periods)
-            year_dir = cfg.outdir / label_id / str(year)
+            year_dir = cfg.data_root / label_id / str(year)
             year_dir.mkdir(parents=True, exist_ok=True)
             manifest_path = year_dir / "manifest.txt"
             done = set()
