@@ -1,9 +1,6 @@
 """
-Create a minimal OceanParcels simulation over eReefs GBR1 weekly subcubes using a prebuilt f-node grid.
-
 This script demonstrates the basic setup and execution of a particle simulation using the OceanParcels
-library, leveraging the eReefs GBR1 dataset. It focuses on a single weekly subcube and uses a precomputed
-f-node grid for accurate C-grid interpolation.
+library, leveraging the eReefs GBR1 dataset. It focuses on simulating a single particle.
 
 Key Steps:
 1. Load the necessary libraries and configuration.
@@ -21,7 +18,6 @@ import argparse
 import contextlib
 import logging
 from pathlib import Path
-from dataclasses import dataclass
 from typing import List, Sequence
 from datetime import timedelta, date
 import warnings
@@ -33,7 +29,6 @@ import geopandas as gpd  # reef metadata
 
 from utils import (
     configure_logging,
-    sanitize_name,
     load_config,
     expand_date_periods_for_year,
     depth_token,
@@ -42,22 +37,6 @@ from utils import (
 
 from parcels import FieldSet, ParticleSet, JITParticle, AdvectionRK4
 import parcels  # needed for parcels.StatusCode in DeleteParticle handler
-try:  # noqa: SIM105
-    from parcels.tools.error import ErrorCode  # type: ignore
-except Exception:  # noqa: BLE001
-    ErrorCode = None
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-@dataclass
-class SubcubeMeta:
-    path: Path
-    lon: np.ndarray
-    lat: np.ndarray
-    k_index: int
-    times: np.ndarray  # datetime64
-
 
 # ------------------------------ Helpers ---------------------------------
 
@@ -71,51 +50,18 @@ def discover_daily_files(data_root: Path, label_id: str, year: int, model_name: 
     files = sorted(year_dir.glob(pattern))
     return files
 
-def load_subcube_meta(path: Path) -> SubcubeMeta:
-    try:
-        ds = xr.open_dataset(path, decode_times=True)
-    except Exception as e:  # noqa: BLE001
-        raise SystemExit(f"Failed to open subcube {path}: {e}") from e
-    for v in ("longitude", "latitude", "time"):
-        if v not in ds:
-            raise SystemExit(f"Subcube {path} missing variable {v}")
-    if 'k_index' not in ds.attrs:
-        # Accept absence; use -1 sentinel
-        k_index = int(ds.attrs.get('k_index', -1))
-    else:
-        k_index = int(ds.attrs['k_index'])
-    meta = SubcubeMeta(
-        path=path,
-        lon=ds['longitude'].values,
-        lat=ds['latitude'].values,
-        k_index=k_index,
-        times=ds['time'].values,
-    )
-    ds.close()
-    return meta
+def open_time_series(selected_files: List[Path]) -> xr.Dataset:
+    """Open all selected daily files as a single time-series dataset.
 
-def build_fieldset(daily_files: List[Path], first_meta: SubcubeMeta) -> FieldSet:
-    ds_list = [xr.open_dataset(p, decode_times=True) for p in daily_files]
-    try:
-        combined = xr.concat(ds_list, dim='time')
-        # Heuristic U/V variable names
-        cand_u = [v for v in combined.data_vars if v.lower().startswith('u')]
-        cand_v = [v for v in combined.data_vars if v.lower().startswith('v')]
-        if not cand_u or not cand_v:
-            raise SystemExit("Cannot identify U/V variables in daily files")
-        u_name, v_name = cand_u[0], cand_v[0]
-        u_vals = combined[u_name].transpose('time','j','i').values
-        v_vals = combined[v_name].transpose('time','j','i').values
-        time_vals = combined['time'].values
-    finally:
-        for d in ds_list:
-            d.close()
-    data = {'U': u_vals, 'V': v_vals}
-    dimensions = {
-        'U': {'lon': first_meta.lon, 'lat': first_meta.lat, 'time': time_vals},
-        'V': {'lon': first_meta.lon, 'lat': first_meta.lat, 'time': time_vals},
-    }
-    return FieldSet.from_data(data=data, dimensions=dimensions, mesh='spherical', allow_time_extrapolation=False)
+    Uses by_coords combination and drops conflicting attrs (rare for curated extractions).
+    Caller is responsible for closing the returned dataset.
+    """
+    return xr.open_mfdataset(
+        [str(p) for p in selected_files],
+        combine='by_coords',
+        decode_times=True,
+        combine_attrs='drop_conflicts'
+    )
 
 
 
@@ -124,7 +70,7 @@ def build_fieldset(daily_files: List[Path], first_meta: SubcubeMeta) -> FieldSet
 def run_simulation(cfg) -> None:
     log = logging.getLogger(__name__)
     # Load reef names once
-    reef_shp = Path("data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp")
+    reef_shp = cfg.reef_shp
     if not reef_shp.exists():
         raise SystemExit(f"Reef shapefile missing. Have you run 01-download: {reef_shp}")
     reefs = gpd.read_file(reef_shp)
@@ -161,32 +107,54 @@ def run_simulation(cfg) -> None:
                 continue
             selected_files = [date_map[d] for d in selected_days]
 
-            meta = load_subcube_meta(selected_files[0])
-            # Build fieldset
-            fieldset = build_fieldset(selected_files, meta)
-            
-            # Efficient determination of overall time span: open only first and last daily file
+            # Open combined time-series dataset once
             try:
-                with xr.open_dataset(str(selected_files[0]), decode_times=True) as ds_first:
-                    t0_vals = pd.to_datetime(ds_first['time'].values)
-                    t_start = t0_vals.min()
-                with xr.open_dataset(str(selected_files[-1]), decode_times=True) as ds_last:
-                    tN_vals = pd.to_datetime(ds_last['time'].values)
-                    t_end_full = tN_vals.max()
-                # Sanity: ensure ordering
-                if t_end_full < t_start:
-                    raise ValueError("End time earlier than start time in optimized span computation")
-                # Optionally verify expected daily coverage when more than 1 day
-                # (Skip heavy validation; user requested lightweight approach)
-            except Exception as e:  # fallback to prior robust method
-                log.debug("Optimized time-span detection failed (%s); falling back to opening all files", e)
-                ds_cat = xr.open_mfdataset([str(p) for p in selected_files], combine='by_coords')
-                try:
-                    times = pd.to_datetime(ds_cat['time'].values)
-                    t_start = times.min()
-                    t_end_full = times.max()
-                finally:
-                    ds_cat.close()
+                ds_ts = open_time_series(selected_files)
+            except Exception as e:  # noqa: BLE001
+                log.error("Failed to open combined dataset for %s %d: %s", label_id, year, e)
+                continue
+            # --------------------------------------------------------------
+            # Assert buffer_km in config matches metadata in extracted files
+            # This guards against running simulations on stale subcubes when
+            # the spatial buffer was changed. 
+            file_buffer_km = ds_ts.attrs.get('buffer_km', None)
+            assert file_buffer_km is not None, f"Combined dataset missing buffer_km metadata"
+
+            assert abs(float(file_buffer_km) - float(cfg.buffer_km)) < 1e-6, (
+                f"Config buffer_km={cfg.buffer_km} mismatches dataset buffer_km={file_buffer_km}; "
+                f"re-run 03-extract-gbr1-subcubes.py with buffer_km={cfg.buffer_km} (or update config to {file_buffer_km})."
+            )
+            # --------------------------------------------------------------
+            # Build fieldset
+            # Extract lon/lat/time and U/V variables from combined dataset
+            for req in ("longitude", "latitude", "time"):
+                if req not in ds_ts:
+                    log.error("Combined dataset missing variable %s for %s %d", req, label_id, year)
+                    ds_ts.close()
+                    continue
+            lon_arr = ds_ts['longitude'].values
+            lat_arr = ds_ts['latitude'].values
+            times_all = pd.to_datetime(ds_ts['time'].values)
+            t_start = times_all.min()
+            t_end_full = times_all.max()
+            # Identify U/V candidate variables
+            cand_u = [v for v in ds_ts.data_vars if v.lower().startswith('u')]
+            cand_v = [v for v in ds_ts.data_vars if v.lower().startswith('v')]
+            if not cand_u or not cand_v:
+                log.error("Cannot identify U/V variables in combined dataset for %s %d", label_id, year)
+                ds_ts.close()
+                continue
+            u_name, v_name = cand_u[0], cand_v[0]
+            # Build FieldSet from in-memory arrays
+            u_vals = ds_ts[u_name].transpose('time','j','i').values
+            v_vals = ds_ts[v_name].transpose('time','j','i').values
+            data = {'U': u_vals, 'V': v_vals}
+            dimensions = {
+                'U': {'lon': lon_arr, 'lat': lat_arr, 'time': times_all.values},
+                'V': {'lon': lon_arr, 'lat': lat_arr, 'time': times_all.values},
+            }
+            fieldset = FieldSet.from_data(data=data, dimensions=dimensions, mesh='spherical', allow_time_extrapolation=False)
+ 
             available_hours = (t_end_full - t_start).total_seconds() / 3600.0
             if cfg.runtime is not None:
                 if cfg.runtime > available_hours + 1e-6:  # allow tiny float tolerance
@@ -210,7 +178,7 @@ def run_simulation(cfg) -> None:
                 import shutil
                 shutil.rmtree(out_path, ignore_errors=True)
             # Seed in interior
-            lon_arr, lat_arr = meta.lon, meta.lat
+            # lon_arr, lat_arr already defined above
             mask = np.isfinite(lon_arr) & np.isfinite(lat_arr)
             if not mask.any():
                 log.error("All lon/lat NaN for %s %d", label_id, year)
@@ -219,7 +187,8 @@ def run_simulation(cfg) -> None:
             jmid = int((js.min()+js.max())//2)
             imid = int((is_.min()+is_.max())//2)
             lon0 = float(lon_arr[jmid, imid]); lat0 = float(lat_arr[jmid, imid])
-            class Particle(JITParticle):
+            class Particle(JITParticle):  # noqa: D401
+                """Minimal particle class (can extend with custom variables later)."""
                 pass
             pset = ParticleSet.from_list(fieldset=fieldset, pclass=Particle, lon=[lon0], lat=[lat0], time=t_start.to_pydatetime())
             with contextlib.suppress(Exception):
@@ -241,18 +210,20 @@ def run_simulation(cfg) -> None:
                 with contextlib.suppress(Exception):
                     pfile.close()
             log.info("Wrote simulation %s (runtime_hours=%.2f length_days=%d)", out_path, runtime_hours, sim_length_days)
+            # Close combined dataset once finished with this reef/year
+            with contextlib.suppress(Exception):
+                ds_ts.close()
 
     log.info("All simulations complete")
 
 # ------------------------------ CLI entry --------------------------------
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Particle simulation over daily eReefs subcubes (config-only)")
-    p.add_argument('--config', required=True, type=Path, help='Path to TOML config')
-    return p.parse_args(argv)
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
+
+    p = argparse.ArgumentParser(description="Particle simulation over daily eReefs subcubes (config-only)")
+    p.add_argument('--config', required=True, type=Path, help='Path to TOML config')
+    args = p.parse_args(argv)
     cfg = load_config(args.config)
     configure_logging(cfg.log_file)
     run_simulation(cfg)
