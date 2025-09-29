@@ -22,9 +22,10 @@ eReefs is a suite of hydrodynamic and biogeochemical models for the Great Barrie
 
 NetCDF is a common scientific file format used for multidimensional arrays such as longitude by latitude by time. It stores metadata like variable names and units, which helps tools read the data correctly. OPeNDAP is a web service that lets you read parts of large NetCDF datasets over the internet as if they were local. In our first stage we connect to eReefs via OPeNDAP to read only the variables and the grid cells we need. We then save that subset to a local NetCDF file. Working locally is faster and makes debugging the second stage repeatable.
 
-## Why the grid looks tilted and what a curvilinear grid means
+# How the eReefs grid is organised
 
-GBR1 uses a curvilinear grid. Instead of longitudes and latitudes forming perfect straight lines, the grid lines curve gently to follow the coastline and fit more cells into interesting places. This is efficient for the model but it makes simple geographic boxes a poor fit. The solution is to find the smallest rectangle in grid index space that covers the geographic area we care about. Conceptually you draw a geographic bounding box around a reef buffered by about 10 km, find which curvilinear cells intersect that box, then take the minimum and maximum i and j indices that contain them. The result is a neat i-j rectangle that exactly matches the model’s storage layout. We use that rectangle for extraction and for the later particle runs.
+GBR1 uses a curvilinear grid that follows the coastline and shelf. The dataset stores two two dimensional coordinate arrays called longitude and latitude. Each element of those arrays is the geographic location of the centre of a model cell. Think of these as the centroids of a gently tilted mesh rather than the corners of a perfect rectangle. The valid ocean cells form an L shaped patch within the full rectangular index space. Outside that patch the centre coordinates are NaN, which is a deliberate way to mark unused parts of the computational frame in the Coral Sea. 
+
 
 ## Stage 1 in plain language
 
