@@ -56,12 +56,18 @@ def plot_run(lon, lat, times, reef_gdf: gpd.GeoDataFrame, out_png: Path, label_i
     else:
         subset.boundary.plot(ax=ax, color='black', linewidth=1.0, alpha=0.7)
     if color_time and len(times) == len(lon):
-        # Normalize time progression 0..1
+        # Colour points by elapsed hours since simulation start
         t0 = times[0]
-        frac = (times - t0) / (times[-1] - t0) if len(times) > 1 else np.zeros_like(times, dtype=float)
-        sc = ax.scatter(lon, lat, c=frac, s=12, cmap='viridis', edgecolor='none')
+        # Ensure numpy array of timedeltas then convert to hours
+        td = (times - t0)
+        try:
+            # pandas / numpy timedeltas: convert to hours
+            hours = np.array([d / np.timedelta64(1, 'h') for d in td], dtype=float)
+        except Exception:  # fallback safe path
+            hours = np.linspace(0, len(times) - 1, len(times), dtype=float)
+        sc = ax.scatter(lon, lat, c=hours, s=12, cmap='viridis', edgecolor='none')
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Relative Time Progression')
+        cbar.set_label('Hours Since Start')
     else:
         ax.scatter(lon, lat, s=12, color='tab:red', edgecolor='none')
     ax.set_title(f"Trajectory: {gbr_name} ({label_id})")
@@ -82,7 +88,6 @@ def plot_run(lon, lat, times, reef_gdf: gpd.GeoDataFrame, out_png: Path, label_i
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Plot particle trajectories (config-only daily-depth naming)")
     p.add_argument('--config', required=True, type=Path, help='Path to TOML config used for simulation')
-    p.add_argument('--reef-shp', type=Path, default=Path('data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp'))
     p.add_argument('--color-time', action='store_true', help='Colour points by relative time progression')
     p.add_argument('--show', action='store_true', help='Display plot window instead of only saving PNG')
     p.add_argument('--log-file', type=Path, default=None)
@@ -98,12 +103,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     log_file = args.log_file if args.log_file else cfg.log_file
     configure_logging(log_file)
     logging.info("Starting trajectory plotting (config-driven)")
-    # Reef layer
-    try:
-        reef_gdf = load_reef_layer(args.reef_shp)
-    except Exception as e:  # noqa: BLE001
-        logging.error("Failed to load reef layer: %s", e)
-        return 5
+
+    reef_gdf = load_reef_layer(cfg.reef_shp)
+
     name_map = build_label_name_map(reef_gdf)
     depth_tok = depth_token(cfg.depth_m)
     any_plotted = False
