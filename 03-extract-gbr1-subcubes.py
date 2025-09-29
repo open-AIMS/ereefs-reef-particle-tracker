@@ -37,14 +37,12 @@ from utils import (
     sanitize_name,
     load_config,
     expand_date_periods_for_year,
+    load_reef_layer,
 )
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-DEFAULT_REEF_SHP = Path(
-    "data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp"
-)
 
 
 @dataclass(frozen=True)
@@ -79,13 +77,8 @@ def preload_label_polygons(shp_path: Path, requested_ids: List[str]):
     This function is intentionally structured in clear phases so failures (e.g.,
     missing IDs, empty geometries) occur *before* any remote OPeNDAP access.
     """
-    # --- Phase 1: Load & basic validation ---------------------------------
-    if not shp_path.exists():
-        raise SystemExit(f"Reef shapefile not found: {shp_path}")
-    gdf = gpd.read_file(shp_path)
-    if 'LABEL_ID' not in gdf.columns or 'GBR_NAME' not in gdf.columns:
-        raise SystemExit('Shapefile missing LABEL_ID or GBR_NAME columns')
 
+    gdf = load_reef_layer(shp_path)
     # --- Phase 2: Normalise & deduplicate LABEL_IDs ------------------------
     gdf = gdf.drop_duplicates(subset=['LABEL_ID']).copy()
     gdf['LABEL_ID'] = gdf['LABEL_ID'].astype(str)
@@ -207,7 +200,7 @@ def extract(cfg):  # noqa: C901
 
 
     # Preload and validate all requested reef polygons BEFORE any OPeNDAP access (fail fast)
-    reef_meta = preload_label_polygons(DEFAULT_REEF_SHP, [str(i) for i in cfg.ids])
+    reef_meta = preload_label_polygons(cfg.reef_shp, [str(i) for i in cfg.ids])
     grid = load_grid(cfg.opendap_url)
 
     # Precompute grid window (j/i min/max) for each reef using its bbox once.
