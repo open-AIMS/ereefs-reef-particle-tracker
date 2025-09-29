@@ -55,7 +55,8 @@ Trajectory / Time Handling
 Config & Parameters
     Config dataclass fields include: ids, years, weeks (legacy), date_periods, depth_m, k_index,
     data_root (daily subcubes), traces_root (particle simulations), plots_root (optional plot output root),
-    opendap_url, dt_hours, runtime, overwrite, integrator, shrink_margin, log_file, buffer_km.
+    opendap_url, reef_shp (reef metadata layer), dt_hours, runtime, overwrite, integrator,
+    shrink_margin, log_file, buffer_km.
     load_config(path) -> Config
         TOML reader supporting single-string or list date_periods.
 
@@ -305,6 +306,7 @@ class Config:
     traces_root: Path  # directory for simulation (particle) outputs
     plots_root: Path | None  # optional separate root for plots (falls back to traces_root if None)
     opendap_url: str
+    reef_shp: Path
     fnode_nc: Path
     dt_hours: float = 1.0
     runtime: Optional[float] = None
@@ -422,6 +424,7 @@ def load_config(path: Path) -> Config:
     model_name = str(raw.get('model_name', 'gbr1'))
     depth_m = float(raw.get('depth_m', -2.35))
     opendap_url = str(raw.get('opendap_url', 'https://thredds.nci.org.au/thredds/dodsC/fx3/model_data/gbr1_2.0.ncml'))
+    reef_shp = Path(raw.get('reef_shp', 'data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp'))
     fnode_nc = Path(raw.get('fnode_nc', 'working/02/gbr1_fnodes.nc'))
     k_index = int(raw.get('k_index', 40))
     data_root = Path(raw.get('data_root', 'working/03-data'))
@@ -448,7 +451,8 @@ def load_config(path: Path) -> Config:
         data_root=data_root,
     traces_root=traces_root,
     plots_root=plots_root,
-        opendap_url=opendap_url,
+    opendap_url=opendap_url,
+    reef_shp=reef_shp,
         fnode_nc=fnode_nc,
         dt_hours=dt_hours,
         runtime=runtime,
