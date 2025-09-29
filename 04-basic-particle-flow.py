@@ -1,15 +1,30 @@
 """
 This script demonstrates the basic setup and execution of a particle simulation using the OceanParcels
-library, leveraging the eReefs GBR1 dataset. It focuses on simulating a single particle.
+library, leveraging the eReefs GBR1 dataset. It focuses on simulating a single particle released in the 
+centre of each reef polygon. The configuration of the simulation is described by the provided TOML config file.
+This script uses the utils.py helper library to encapsulate common tasks and avoid code duplication.
 
-Key Steps:
-1. Load the necessary libraries and configuration.
-2. Define the simulation parameters, including the subcube to process.
-3. Validate the input data and ensure all required attributes are present.
-4. Construct the Parcels FieldSet using the f-node grid and subcube data.
-5. Initialize and run the particle simulation.
-6. Save the output trajectory data in Zarr format.
+Design Choices (Why it looks like this)
+---------------------------------------
+* We open all selected daily NetCDFs **once** via `xarray.open_mfdataset` and then immediately
+    materialise U/V into NumPy arrays. Parcels' `FieldSet.from_data` expects in‑memory arrays; so
+    further lazy/dask sophistication would not help here.
+* Only a single particle is seeded to keep the example compact. Extending to N particles simply
+    passes lists of lon/lat (and optionally depth/time) when constructing the `ParticleSet`.
+* We validate the `buffer_km` metadata to ensure the simulation is consistent with the extraction
+    configuration. This helps avoid silent mismatches when re‑using older subcubes.
+* Out‑of‑bounds deletion is handled via a tiny kernel (`DeleteParticle`) that checks Parcels'
+    `StatusCode`. For larger simulations you might instead use recovery callbacks or bounding logic.
+* The naming of output Zarr stores is centralised in `utils.simulation_filename` so that the plotting
+    script (05) can rediscover outputs without duplicating naming logic.
 
+What This Example Omits (Simplifications)
+-----------------------------------------
+* No vertical motion / diffusion terms (pure 2‑D surface advection).
+* No stochastic perturbations or additional kernels (e.g., diffusion, sinking).
+* No parallel execution / chunked streaming of very long time ranges.
+* No multi‑particle management (status accounting, per‑particle variables, etc.).
+* No rigorous continuity checks on the assembled time axis (assumes extraction script produced clean 24 h files).
 """
 
 from __future__ import annotations
@@ -43,6 +58,12 @@ import parcels  # needed for parcels.StatusCode in DeleteParticle handler
 ## depth_token now provided by utils
 
 def discover_daily_files(data_root: Path, label_id: str, year: int, model_name: str, depth_tok: str) -> List[Path]:
+    """Return sorted list of daily NetCDF paths for one reef/year.
+
+    NOTE: The filename pattern searched here is intentionally broad (`*_UV_*YEAR*`). We rely on
+    later filtering (by date token) to obtain only valid daily depth‑specific files. This keeps the
+    discovery simple while allowing minor naming evolutions as long as trailing date tokens stay stable.
+    """
     year_dir = data_root / label_id / str(year)
     if not year_dir.exists():
         return []
@@ -55,6 +76,10 @@ def open_time_series(selected_files: List[Path]) -> xr.Dataset:
 
     Uses by_coords combination and drops conflicting attrs (rare for curated extractions).
     Caller is responsible for closing the returned dataset.
+    
+    Performance note: Because we subsequently convert U/V to NumPy arrays, holding the full Dataset
+    in memory briefly does not materially increase peak memory relative to the data already loaded
+    into the FieldSet.
     """
     return xr.open_mfdataset(
         [str(p) for p in selected_files],
@@ -69,7 +94,7 @@ def open_time_series(selected_files: List[Path]) -> xr.Dataset:
 
 def run_simulation(cfg) -> None:
     log = logging.getLogger(__name__)
-    # Load reef names once
+    # Load reef names once (shared for all reefs/years). We only need LABEL_ID -> GBR_NAME mapping here.
     reef_shp = cfg.reef_shp
     if not reef_shp.exists():
         raise SystemExit(f"Reef shapefile missing. Have you run 01-download: {reef_shp}")
@@ -82,12 +107,12 @@ def run_simulation(cfg) -> None:
             log.warning("LABEL_ID %s not found in reef layer; skipping", label_id)
             continue
         for year in cfg.years:
-            # ---------- Create a map of all daily files for this reef/year --------
+            # ---------- 1. Discover candidate daily files for this reef/year --------
             daily_files = discover_daily_files(cfg.data_root, label_id, year, cfg.model_name, depth_tok)
             if not daily_files:
                 log.warning("No daily files for %s %d", label_id, year)
                 continue
-            # Filter by date periods if provided
+            # Build quick lookup from parsed date -> file for later period filtering.
             date_map = {}
             for p in daily_files:
                 try:
@@ -96,7 +121,7 @@ def run_simulation(cfg) -> None:
                     date_map[d] = p
                 except Exception:
                     continue
-            # ------------ Find the date_periods files with the map ------------
+            # ------------ 2. Apply date_period filtering (if configured) ------------
             if cfg.date_periods:
                 days_allowed = set(expand_date_periods_for_year(year, cfg.date_periods))
                 selected_days = sorted(d for d in date_map if d in days_allowed)
@@ -107,7 +132,7 @@ def run_simulation(cfg) -> None:
                 continue
             selected_files = [date_map[d] for d in selected_days]
 
-            # Open combined time-series dataset once
+            # ---------- 3. Open combined time-series dataset once ----------
             try:
                 ds_ts = open_time_series(selected_files)
             except Exception as e:  # noqa: BLE001
@@ -124,9 +149,7 @@ def run_simulation(cfg) -> None:
                 f"Config buffer_km={cfg.buffer_km} mismatches dataset buffer_km={file_buffer_km}; "
                 f"re-run 03-extract-gbr1-subcubes.py with buffer_km={cfg.buffer_km} (or update config to {file_buffer_km})."
             )
-            # --------------------------------------------------------------
-            # Build fieldset
-            # Extract lon/lat/time and U/V variables from combined dataset
+            # ---------- 4. Extract lon/lat/time (assume standard eReefs 'u'/'v' velocity variables) ----------
             for req in ("longitude", "latitude", "time"):
                 if req not in ds_ts:
                     log.error("Combined dataset missing variable %s for %s %d", req, label_id, year)
@@ -137,17 +160,11 @@ def run_simulation(cfg) -> None:
             times_all = pd.to_datetime(ds_ts['time'].values)
             t_start = times_all.min()
             t_end_full = times_all.max()
-            # Identify U/V candidate variables
-            cand_u = [v for v in ds_ts.data_vars if v.lower().startswith('u')]
-            cand_v = [v for v in ds_ts.data_vars if v.lower().startswith('v')]
-            if not cand_u or not cand_v:
-                log.error("Cannot identify U/V variables in combined dataset for %s %d", label_id, year)
-                ds_ts.close()
-                continue
-            u_name, v_name = cand_u[0], cand_v[0]
-            # Build FieldSet from in-memory arrays
-            u_vals = ds_ts[u_name].transpose('time','j','i').values
-            v_vals = ds_ts[v_name].transpose('time','j','i').values
+
+            # ---------- 5. Build FieldSet (core Parcels data structure) ----------
+            # We pass 'mesh="spherical"' so Parcels treats lon/lat as geographic degrees.
+            u_vals = ds_ts['u'].transpose('time','j','i').values
+            v_vals = ds_ts['v'].transpose('time','j','i').values
             data = {'U': u_vals, 'V': v_vals}
             dimensions = {
                 'U': {'lon': lon_arr, 'lat': lat_arr, 'time': times_all.values},
@@ -155,6 +172,7 @@ def run_simulation(cfg) -> None:
             }
             fieldset = FieldSet.from_data(data=data, dimensions=dimensions, mesh='spherical', allow_time_extrapolation=False)
  
+            # ---------- 6. Determine runtime (cap to data coverage) ----------
             available_hours = (t_end_full - t_start).total_seconds() / 3600.0
             if cfg.runtime is not None:
                 if cfg.runtime > available_hours + 1e-6:  # allow tiny float tolerance
@@ -169,6 +187,7 @@ def run_simulation(cfg) -> None:
                 log.warning("No positive runtime available for %s %d (span %.2f h); skipping", label_id, year, available_hours)
                 continue
             t_end = t_start + pd.Timedelta(hours=runtime_hours)
+            # Length in days (integer ceiling) used as part of the output filename for traceability.
             sim_length_days = int(np.ceil(runtime_hours/24.0))
             out_path = simulation_filename(cfg.traces_root, cfg.model_name, label_id, cfg.depth_m, t_start.date(), sim_length_days)
             if out_path.exists() and not cfg.overwrite:
@@ -177,7 +196,7 @@ def run_simulation(cfg) -> None:
             if out_path.exists() and cfg.overwrite:
                 import shutil
                 shutil.rmtree(out_path, ignore_errors=True)
-            # Seed in interior
+            # ---------- 7. Seed a single particle roughly at centre of valid lon/lat footprint ----------
             # lon_arr, lat_arr already defined above
             mask = np.isfinite(lon_arr) & np.isfinite(lat_arr)
             if not mask.any():
@@ -194,13 +213,20 @@ def run_simulation(cfg) -> None:
             with contextlib.suppress(Exception):
                 pset.populate_indices()
 
+            # ---------- 8. Configure output cadence & file writer ----------
             output_dt = timedelta(hours=cfg.dt_hours)
             log.debug("Simulation timesteps: integration=%.3f h output=%.3f h", cfg.dt_hours, cfg.dt_hours)
             pfile = pset.ParticleFile(name=str(out_path), outputdt=output_dt)
             try:
+                # ---------- 9. Define a lightweight deletion kernel for out-of-bounds ----------
+                # Parcels sets a StatusCode on particles that encounter domain errors. We simply
+                # delete those particles to avoid run termination. For multi-particle scenarios
+                # you might increment counters or log diagnostic information here.
                 def DeleteParticle(particle, fieldset, time):
                     if particle.state == parcels.StatusCode.ErrorOutOfBounds:
                         particle.delete()
+                # Execute with base advection + deletion kernel. Additional behavior (e.g., diffusion)
+                # would be appended to this list.
                 pset.execute([AdvectionRK4,DeleteParticle], 
                              runtime=timedelta(hours=runtime_hours), 
                              dt=timedelta(hours=cfg.dt_hours), 
