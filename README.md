@@ -45,7 +45,7 @@ cd {path to this project source code}
 ```
 6. (Optional) Verify key packages:
 ```bash
-c
+python -c "import parcels, geopandas, xarray; print('OK')"
 ```
 7. (Optional) Remove the environment if you need to start over:
 ```bash
