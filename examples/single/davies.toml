@@ -1,0 +1,14 @@
+# Simulate a single particle released on Davies Reef. Use with script 03.
+ids = ["18-096"]                 # Davies Reef       
+years = [2023]                  # 
+date_periods = "Jan01-Jan03"    # Date range to download data. Sampled on July 08
+model_name = "gbr1_2.0"         # Short model identifier for naming
+depth_m = -2.35                 # Target depth (m, negative downward) uses nearest depth layer
+buffer_km = 30
+data_root = "working/03-data/single"      # Directory containing extracted daily subcubes
+traces_root = "C:/Temp/gis/ereefs-traces/single"  # Directory to save particle simulation traces
+plots_root = "working/05-plots/single"
+opendap_url = "https://thredds.nci.org.au/thredds/dodsC/fx3/model_data/gbr1_2.0.ncml"
+dt_hours = 0.2                  # Integration timestep (hours)
+runtime = 32                    # Optional max runtime (hours)
+overwrite = false                # Overwrite existing outputs if true
