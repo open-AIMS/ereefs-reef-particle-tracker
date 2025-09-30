@@ -1,11 +1,11 @@
-"""Config-driven GBR1 daily subcube extractor (refactored to spec).
+"""Config-driven GBR1 daily subcube extractor.
 
 Generates one NetCDF per reef per day at target depth (nearest vertical level).
 
 Directory structure:
     <data_root>/<LABEL_ID>/<YEAR>/<file>.nc
 Filename pattern (spec):
-    {model_name}{label_id}UV{depthToken}{YYYYMMDD}.nc
+    {model_name}_{label_id}_UV_{depth_tok}_{YYYYMMDD}.nc
   depthToken keeps sign, up to 2 decimals, suffixed with 'm' (e.g. -2.35m, -2m)
 
 Config keys (TOML):
@@ -13,7 +13,7 @@ Config keys (TOML):
     OPTIONAL: date_periods = ["Jan01-Apr30", "Nov15-Dec31"] (if omitted or empty => full year)
                         buffer_km = <float> (optional horizontal buffer applied around reef polygon when computing ij window; default 0)
 
-This script is now config-only (CLI provides only --config). Week logic removed.
+This script is now config-only (CLI provides only --config). 
 """
 from __future__ import annotations
 
@@ -295,7 +295,7 @@ def extract(cfg):  # noqa: C901
                         'buffer_km': cfg.buffer_km,
                         'hours_in_file': int(sub_uv.dims.get('time', -1)),
                         'extraction_date': date.today().isoformat(),
-                        'history': f"created by 03-extract-gbr1-subcubes.py on {date.today().isoformat()}",
+                        'history': f"created by 03-extract-ereefs-reef-data.py on {date.today().isoformat()}",
                         'note_depth_resolution': 'depth_m mapped to nearest model zc at extraction time',
                     })
                     try:
