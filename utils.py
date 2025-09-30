@@ -55,8 +55,8 @@ Trajectory / Time Handling
 Config & Parameters
     Config dataclass fields include: ids, years, weeks (legacy), date_periods, depth_m, k_index,
     data_root (daily subcubes), traces_root (particle simulations), plots_root (optional plot output root),
-    opendap_url, reef_shp (reef metadata layer), dt_hours, runtime, overwrite, integrator,
-    shrink_margin, log_file, buffer_km.
+    opendap_url, reef_shp (reef metadata layer), dt_hours, runtime, overwrite,
+    log_file, buffer_km.
     load_config(path) -> Config
         TOML reader supporting single-string or list date_periods.
 
@@ -154,6 +154,19 @@ def depth_token(depth_m: float) -> str:
 def simulation_filename(root: Path, model_name: str, label_id: str, depth_m: float, start_date, length_days: int) -> Path:  # start_date: date
     tok = depth_token(depth_m)
     stem = f"{model_name}_{label_id}_particles_{tok}_{start_date:%Y%m%d}_{length_days}d.zarr"
+    return root / label_id / f"{start_date.year}" / stem
+
+def multi_particle_simulation_filename(root: Path, model_name: str, label_id: str, depth_m: float, start_date, length_days: int, num_particles: int) -> Path:
+    """Return path for multi-particle simulation Zarr store.
+
+    Pattern:
+        {model}_{LABEL_ID}_mparticles_{depthTok}_{YYYYMMDD}_{Nd}_{Np}p.zarr
+
+    Rationale: Distinguish from single-particle runs and encode particle count for quick discovery
+    and downstream grouping. 'mparticles' token avoids accidental collision with legacy naming.
+    """
+    tok = depth_token(depth_m)
+    stem = f"{model_name}_{label_id}_mparticles_{tok}_{start_date:%Y%m%d}_{length_days}d_{num_particles}p.zarr"
     return root / label_id / f"{start_date.year}" / stem
 
 # ---------------------------------------------------------------------------
@@ -311,10 +324,13 @@ class Config:
     dt_hours: float = 1.0
     runtime: Optional[float] = None
     overwrite: bool = False
-    integrator: str = 'rk4'
-    shrink_margin: int = 1
     log_file: Optional[Path] = None
     buffer_km: float = 0.0
+    # Multi-particle experiment parameters (script 06)
+    num_particles: int = 0              # 0 -> feature disabled unless script provides override
+    injection_interval: int = 7         # days between injections (start-date stepping)
+    random_seed: Optional[int] = None   # base seed; combined with label_id/start_date for deterministic runs
+    kh_m2s: float = 0.0                 # horizontal diffusion coefficient (m^2/s); 0 disables diffusion
 
 MONTH_MAP = {m.lower(): i for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], start=1)}
 
@@ -435,11 +451,14 @@ def load_config(path: Path) -> Config:
     runtime = raw.get('runtime')
     runtime = float(runtime) if runtime is not None else None
     overwrite = bool(raw.get('overwrite', False))
-    integrator = str(raw.get('integrator', 'rk4')).lower()
-    shrink_margin = int(raw.get('shrink_margin', 1))
     log_file_raw = raw.get('log_file')
     log_file = Path(log_file_raw) if log_file_raw else None
     buffer_km = float(raw.get('buffer_km', 0.0))
+    num_particles = int(raw.get('num_particles', 0))
+    injection_interval = int(raw.get('injection_interval', 7))
+    random_seed = raw.get('random_seed')
+    random_seed = int(random_seed) if random_seed is not None else None
+    kh_m2s = float(raw.get('kh_m2s', 0.0))
     cfg = Config(
         ids=ids,
         years=years,
@@ -449,18 +468,20 @@ def load_config(path: Path) -> Config:
         depth_m=depth_m,
         k_index=k_index,
         data_root=data_root,
-    traces_root=traces_root,
-    plots_root=plots_root,
-    opendap_url=opendap_url,
-    reef_shp=reef_shp,
+        traces_root=traces_root,
+        plots_root=plots_root,
+        opendap_url=opendap_url,
+        reef_shp=reef_shp,
         fnode_nc=fnode_nc,
         dt_hours=dt_hours,
         runtime=runtime,
         overwrite=overwrite,
-        integrator=integrator,
-        shrink_margin=shrink_margin,
         log_file=log_file,
         buffer_km=buffer_km,
+        num_particles=num_particles,
+        injection_interval=injection_interval,
+        random_seed=random_seed,
+        kh_m2s=kh_m2s,
     )
     return cfg
 
@@ -500,5 +521,5 @@ __all__ = [
     'normalize_years','normalize_weeks','make_week_tag','ordinal_week_for_date','expand_weeks_to_dates',
     'load_reef_layer','build_label_name_map','Trajectory','load_parcels_zarr','reconstruct_times','ensure_utc',
     'discover_week_tags','auto_detect_single_week','Config','load_config',
-    'normalize_date_periods','expand_date_periods_for_year','make_period_tag','depth_token','simulation_filename'
+    'normalize_date_periods','expand_date_periods_for_year','make_period_tag','depth_token','simulation_filename','multi_particle_simulation_filename'
 ]
