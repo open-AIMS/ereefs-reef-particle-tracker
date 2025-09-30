@@ -1,5 +1,5 @@
 # eReefs reef particle flow demo
-This repository contains scripts for combining eReefs with the oceanparcels library to simulate particles dispersing from reefs. Each simulation is setup using a config file. In the current implementation each simulation can specify a set of reefs (specified by their GBRMPA GBR Features LABEL_ID such as 18-068 for Davies reef), a time period for the simulation, the simulation time step and the number of particles. The particles are released randomly across the surface of the reef. Each simulation run run for a set period of time (typically a couple of days). Particles that stray too far away from the reef are deleted from the simulation. The simulation area is specified by a buffer distance around the reef (`buffer_km`).
+This repository contains scripts for combining [eReefs](https://www.ereefs.org.au/) with the [Oceanparcels](https://oceanparcels.org/) library to simulate particles dispersing from reefs. Each simulation is setup using a config file. In the current implementation each simulation can specify a set of reefs (specified by their GBRMPA GBR Features LABEL_ID such as 18-068 for Davies reef), a time period for the simulation, the simulation time step and the number of particles. The particles are released randomly across the surface of the reef. Each simulation run run for a set period of time (typically a couple of days). Particles that stray too far away from the reef are deleted from the simulation. The simulation area is specified by a buffer distance around the reef (`buffer_km`).
 
 ## Limitations
 - Particles follow the currents on a fixed 2D depth layer.
@@ -10,6 +10,11 @@ This repository contains scripts for combining eReefs with the oceanparcels libr
 - While multiple reefs can be simulated in one config file they all share a common date range and other simulation parameters. If you need different dates for different reefs then multiple configs will be needed.
 - Downloading the eReefs current data patches for each reef is quite slow. It takes about 8-10 sec per day per reef. If you want long time series for many reefs the downloads can take hours.
 
+## Choice of ocean current data - eReefs GBR1
+In these scripts we used the eReefs GBR1 hydrodynamic model to provide the time varying estimates of current that determine the movement of particles. We used this model because it is a pre-existing relatively high resolution model covering the GBR from 2015 - 2024. This model is not really high enough resolution to properly characterise the flow of water across the reef lagoons, however it is the best we have without create a new higher resolution model.
+
+## eReefs grids and flow modelling
+OceanParcels support modelling flows using various types of grids including regular retangular grids, curvilinear grid. Each of these grids have variations in structure depending on whether the current flows are on the edges of the pixels or in the middle. eReefs’ SHOC hydrodynamic core uses [Arakawa C-grid](https://research.csiro.au/ereefs/models/models-about/models-hydrodynamics/) staggering on an orthogonal curvilinear horizontal grid. In C-grid terms, tracers are at cell centres and the velocity components are defined on the cell faces. For public release, eReefs exports a “simple” center‑collocated product in which u and v have already been interpolated or averaged back onto the tracer (cell‑center) points, effectively presenting an A‑grid view. As a result we use an A-grid in the OceanParcels simulations. 
 
 ## Quick Conda Setup (Miniconda or Anaconda)
 If you don't already have Conda:
@@ -40,7 +45,7 @@ cd {path to this project source code}
 ```
 6. (Optional) Verify key packages:
 ```bash
-python -c "import parcels, geopandas, xarray; print('OK')"
+c
 ```
 7. (Optional) Remove the environment if you need to start over:
 ```bash
@@ -50,7 +55,7 @@ conda remove -n reef-residency --all
 ## Overview of scripts
 
 ### 01-download-reef-data.py
-This script downloads the [reef boundaries dataset](https://doi.org/10.26274/vhj5-gr60) used for determining the reef polygons from the label_ids specified in the config. Particles are release randomly from within the reef boundary polygon (`06-multi-partilce-flow.py`). The reef boundary polygons are also used for plotting.
+This script downloads the [reef boundaries dataset](https://doi.org/10.26274/vhj5-gr60) used for determining the reef polygons from the label_ids specified in the config. Particles are release randomly from within the reef boundary polygon (`06-multi-partilce-flow.py`). The reef boundary polygons are also used for plotting. This script will automatically skip the download if it has already been done before.
 
 ### 03-extract-ereefs-reef-data.py
 This script downloads the eReefs data around the selected reefs for the time periods specfied in the config file. This uses OpenDAP to download daily files, saved as NetCDF files, organised by the reef label_id and the year. If you change the buffer_km then you will need to redo the download.
@@ -76,30 +81,36 @@ This plots the results of 06-multi-particle-flow.py. This creates one plot per z
 ### Single particle simulation demo - Useless but as simple as possible.
 This simulation simulates a single particle for each reef listed in the config.toml. It is not intended to be useful, but was the starting point for making more complex simulations. This was the first script that I developed.
 
-1. Download the reef boundary dataset. This is used in multiple scripts and only needs to be done once.
+1. Download the reef boundary dataset. This is used in multiple scripts and only needs to be done once. 
 ```bash
 python 01-download-reef-data.py
 ```
 
 2. Extracts the eReefs [GBR1 hourly hydrodynmaic data from NCI](https://thredds.nci.org.au/thredds/catalog/fx3/gbr1_2.0/catalog.html) and save the result as local NetCDF files. These files are used by the particle movement simulation. A small region (set by the buffer_km) around each reef is downloaded for the time period specified.
+Takes ~1 min
 ```bash
-python 03-extract-ereefs-reef-data.py --config debug.toml
+python 03-extract-ereefs-reef-data.py --config examples/single/davies.toml
 ```
 3. Run the particle simulation - Make that one particle go.
-This runs the particle tracing on a single particle places in the middle of the reef. One thing to note is that in the config file `debug.toml'
+This runs the particle tracing on a single particle places in the middle of the reef. One thing to note is that in the config file `debug.toml'. Takes < 10 sec.
 ```bash
-python 04-basic-particle-flow.py --config debug.toml
+python 04-basic-particle-flow.py --config examples/single/davies.toml
 ```
-4. Plots the results
+4. Plots the results.
+Takes < 10 sec.
 ```bash
-python 05-basic-particle-flow.py --config debug.toml 
+python 05-plot-basic-particle-flow.py --config examples/single/davies.toml 
 ```
+You should be able to now view the generated particle trace from: \working\05-plots\single\18-096\2023:
 
-## Example - flow off reefs
-This example was targetted at understanding of the flow of water off four reefs at specific sampling dates. The researcher really wanted to know dilution of eDNA on the reef. While we can't simulate this directly we can get an idea of the approximate water resilency by looking at how fast particles on the reef are flushed off. 
-It should be noted that the actual water residency is likely to be significantly longer than that estimated directly from the bulk current flows determined by eReefs. Fine scale shallow reef structures and a rough bottom surface all slow down flow rates across a reef significantly. None of these processes are simulated in this example.
+![Plot of single particle trace from Davies Reef](media/single/gbr1_2.0_18-096_particles_-2.35m_20230101_2d_track.png)
 
-Another aspect that this does not consider is that once the particle move off the reef edge the depth increase dramatically and thus the vertical volume for mixing. The amount of vertical mixing will depend on the wind and waves, which are not considered in this simulation.
+## Multi-particle flow - Single date range
+This example was targetted at understanding of the flow of water off four reefs at specific sampling dates. In this example we generate particle simulation released a couple of days before and after the sampling dates. This is to get a feel for the range of flows at the time of sampling.
+
+The original problem that inspired this example was understand the residency time of the water to better understand the dilution of eDNA on the reef. While we can't simulate this directly we can get an idea of the approximate water resilency by looking at how fast particles on the reef are flushed off. This simulaion is a crude representation because the actual water residency is likely to be significantly longer than shown in this simulation. The eReefs gbr1 models the bulk current flows. The 1 km model grid is too coarse to represent the fine scale shallow reef structures and friction from the rough bottom surface. These all slow down flow rates across a reef significantly. None of these processes are simulated in this example. To do this more accurately we would need create a higher resolution hydrodynamic model around each reef using [RECOM](https://www.ereefs.org.au/research/relocatable-fine-scale-coastal-models.html). 
+
+Another aspect that this simulation does not consider is vertical mixing. Once a particle moves off the reef edge the depth increase dramatically. If there is mixing then the particles should be diluted across a greater range of depths. The amount of vertical mixing will depend on the wind and waves, which are not considered in this simulation.
 
 Some improvements to this modelling could be:
 1. Use the GBR30 bathymetry to estimate the slow down of movement based on the fine scale depth across the reef.
@@ -113,21 +124,23 @@ to create simulations over long period with multiple reefs sharing the same date
 ```bash
 python 01-download-reef-data.py
 ```
-2. Download the eReefs data for the time frame and reefs
+2. Download the eReefs data for the time frame and reefs. Because each reef has a separate sampling date we need to use individual configuration files. Each download takes ~ 1-2 min.
 ```bash
 python 03-extract-ereefs-reef-data.py --config examples/edna/davies.toml
 python 03-extract-ereefs-reef-data.py --config examples/edna/thretford.toml
 python 03-extract-ereefs-reef-data.py --config examples/edna/rib.toml
 python 03-extract-ereefs-reef-data.py --config examples/edna/bowden.toml
 ```
-3. Run the particle simulation
+3. Run the particle simulation.
+Note that this saves the simulation data (`traces_root`) to `C:/Temp/gis/ereefs-traces/eDNA` rather than the local `working` directory. This is to ensure that the traces are not stored on my one drive area. The simulation files are stored in zarr format that results in many files. If you are running on a Mac or don't want the simulation trace data saved there then adjust `traces_root` in `examples/edna/*.toml`. Each simulation takes ~ 1 min.
+
 ```bash
 python 06-multi-particle-flow.py --config examples/edna/davies.toml
 python 06-multi-particle-flow.py --config examples/edna/thretford.toml
 python 06-multi-particle-flow.py --config examples/edna/rib.toml
 python 06-multi-particle-flow.py --config examples/edna/bowden.toml
 ```
-4. Generate the plots for the simulation
+4. Generate the plots for the simulation. Takes about 10 sec per script.
 ```bash
 python 07-plot-multi-particle-flow.py --config examples/edna/davies.toml
 python 07-plot-multi-particle-flow.py --config examples/edna/thretford.toml
@@ -136,6 +149,20 @@ python 07-plot-multi-particle-flow.py --config examples/edna/bowden.toml
 ```
 
 The final plots should then be available in `working/07-plots/eDNA`.
+
+Davies Reef:
+![Generated output plots for Davies Reef](media/edna/18-096.png)
+
+Rib Reef:
+![Generated output plots for Rib Reef](media/edna/18-032.png)
+
+Thretford Reef: 
+![Generated output plots for Thretford Reef](media/edna/16-068.png)
+
+Bowden Reef:
+![Generated output plots for Thretford Reef](media/edna/19-019.png)
+
+
 
 ## Config.toml
 
