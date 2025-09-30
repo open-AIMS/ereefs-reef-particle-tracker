@@ -1,21 +1,102 @@
-# Example configuration for eReefs particle simulation (interim with both weeks & date_periods)
-# Prefer date_periods; weeks retained temporarily for backward compatibility.
-ids = ["18-096","16-068"]            # List of LABEL_ID reef identifiers "18-096" Davies, "16-068" 
-years = [2016]                # Either [YEAR] or list e.g. [2015,2016]
+# Example configuration for eReefs particle simulation. This is a common config file
+# that is used by all the scripts. Each script just picks up attributes that are 
+# relevant to them. Each variable has default if not proved in the config.
+
+# ----------- Common --------------
+# List of LABEL_ID reef identifiers. These come from the GBRMPA GBR Features dataset.
+# See interactive map of https://doi.org/10.26274/vhj5-gr60 to find these IDs
+# or open data/in-3p/GBR_AIMS_Complete-GBR-feat_V1b/TS_AIMS_NESP_Torres_Strait_Features_V1b_with_GBR_Features.shp,
+# downloaded by 01-download-reef-data.py, in QGIS.
+# "18-096" Davies, "16-068" Thretford "18-032" Rib, "19-019" Bowden
+ids = ["18-096","16-068","18-032", "19-019"]      
+
+# Years to download the data for. This can be combined with date_periods to specify
+# that we are interested in just a particular season or period of each year. 
+# Example:
+# The following would download the data for November for every year available for
+# eReefs GBR1 v2.0
+# years = [2015,2016,2017,2018,2019,2020,2021,2022,2023,2024]
+# date_period = "Nov01-Nov30
+years = [2016]                          # Either [YEAR] or list e.g. [2015,2016]
+
 # Date periods use fixed 3-letter month + day (Jan01-Apr30). Multiple periods allowed.
-date_periods = "Jan01-Jan04"
-model_name = "gbr1_2.0"           # Short model identifier for naming
-depth_m = -2.35               # Target depth (m, negative downward) used to choose nearest k
+date_periods = "Jan01-Jan30"
+
+# Short model identifier for naming. This is used at the start of the generated filenames
+model_name = "gbr1_2.0"                 
+
+# Depth slice to track the particles with. This will be mapped to the closest depth slide in
+# the model.
+# Available depths for GBR1 v2.0
+# https://thredds.nci.org.au/thredds/dodsC/fx3/gbr1_2.0/gbr1_simple_2024-01-17.nc.ascii?zc%5B0:1:43%5D
+depth_m = -2.35                         # Target depth (m, negative downward) used to choose nearest k
+
+# If true the rerunning the scripts will redownload/regenerate the outputs. If
+# false the processing associated with an existing output will be skipped. This means
+# that existing downloads will not be redownloaded. To control what gets redone 
+# deleted the files that you want remade.
+overwrite = true                        # Overwrite existing outputs if true
+
+# Location of the log file. If not provided the results are just printed to standard out.
+# log_file = "logs/run.log"   # Optional
+
+
+# ----------- 03-extract-ereefs-reefs-data -------------
+# A buffer is applied to the reef polygon to determine the bounds of the grid to download from
+# eReefs. The polygon is buffered, then turned into a bounding box, then a smaller grid aligned
+# bounding box is used. The actual data downloaded is a grid that is aligned to the Curvilinear
+# ereefs grid. 
+# Typical data and download rates
+# Buffer_km     Data/Reef   Download/reef/day
+# 10            250 KB      6-8 seconds
+# 30            1.5 MB      9-12 seconds
 buffer_km = 30
-# k_index = 40                  # Vertical index (zero-based)
-data_root = "working/03-data"      # Directory containing extracted daily subcubes
-traces_root = "C:/Temp/gis/ereefs-traces"         # Directory to save particle simulation traces
-plots_root = "working/05-plots"
+
+# Root path of where to store the downloaded eReefs data cubes around each reef
+# Data is saved in {data_root}/LABEL_ID/YEAR/*.nc
+data_root = "working/03-data"            # Directory containing extracted daily subcubes
+
+# URL of the eReefs data service to download from. 
 opendap_url = "https://thredds.nci.org.au/thredds/dodsC/fx3/model_data/gbr1_2.0.ncml"
-# fnode_nc = "working/02/gbr1_fnodes.nc"  # Precomputed f-node grid
-dt_hours = 0.1                # Integration timestep (hours)
-runtime = 72                # Optional max runtime (hours)
-overwrite = true             # Overwrite existing outputs if true
-integrator = "rk4"            # rk4 or euler
-shrink_margin = 1             # Interior margin for seeding
-# log_file = "logs/run.log"   # Optional; omit for stdout only
+
+
+# ---------- 05-plot-basic-particle-flow, 07-plot-multi-particle-flow -----------
+# Root folder to same the plots corresponding to each particle simulation.
+plots_root = "working/05-plots"
+
+
+# ---------- 04-basic-particle-flow, 06-multi-particle-flow -----------
+# Root path of where to store the particle trace simulation results. These are saved as
+# zarr files, which is actually a directory of many tiny files (sometimes several thousand).
+# Don't saves these to One Drive.
+# {traces_root}/LABEL_ID/YEAR/
+traces_root = "C:/Temp/gis/ereefs-traces/multi"         # Directory to save particle simulation traces
+
+# Time step between estimating the movement of the particles (hours)
+dt_hours = 0.2    
+
+# Length of time to simulate from the release of the particles on the reef to the
+# end of the simulation. If this is run for too long all the particles will just
+# drift out of the simulation grid. (hours)
+runtime = 48  
+
+
+
+# ------ 06-multi-particle-flow.py parameters ------
+# Number of particles to simulate.
+num_particles = 100
+
+# Number of days between each new simulation
+injection_interval = 7
+
+# See to make the simulations repeatable. This ensures that random effects
+# (release locations and particle diffusion) happen repeatedly
+random_seed = 1234
+
+# Diffusion of the particles. This is brownian dithering to the moving of the
+# particle. It is intended to represent some of the fine scale movement that would occur
+# from small eddies.
+# Random dispersion m2/s. spread std = sqrt(2 kh Δt) 
+# kh of 1 m2s ~ 85 m / hr
+kh_m2s = 0.25
+
