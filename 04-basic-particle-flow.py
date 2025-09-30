@@ -147,7 +147,7 @@ def run_simulation(cfg) -> None:
 
             assert abs(float(file_buffer_km) - float(cfg.buffer_km)) < 1e-6, (
                 f"Config buffer_km={cfg.buffer_km} mismatches dataset buffer_km={file_buffer_km}; "
-                f"re-run 03-extract-gbr1-subcubes.py with buffer_km={cfg.buffer_km} (or update config to {file_buffer_km})."
+                f"re-run 03-extract-ereefs-reef-data.py with buffer_km={cfg.buffer_km} (or update config to {file_buffer_km})."
             )
             # ---------- 4. Extract lon/lat/time (assume standard eReefs 'u'/'v' velocity variables) ----------
             for req in ("longitude", "latitude", "time"):
@@ -220,8 +220,7 @@ def run_simulation(cfg) -> None:
             try:
                 # ---------- 9. Define a lightweight deletion kernel for out-of-bounds ----------
                 # Parcels sets a StatusCode on particles that encounter domain errors. We simply
-                # delete those particles to avoid run termination. For multi-particle scenarios
-                # you might increment counters or log diagnostic information here.
+                # delete those particles to avoid run termination. 
                 def DeleteParticle(particle, fieldset, time):
                     if particle.state == parcels.StatusCode.ErrorOutOfBounds:
                         particle.delete()
